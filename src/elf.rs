@@ -13,6 +13,13 @@
 //! call, following values through non-inlined wrapper functions to their direct callers. Where any
 //! path yields a non-constant value, the site is counted as unknown instead.
 //!
+//! Dynamic symbols, strings and relocations normally come from the dynamic segment (DT_SYMTAB,
+//! DT_STRTAB, DT_REL/DT_RELA). Some deployed programs place those tables outside every PT_LOAD
+//! segment, so their addresses cannot be mapped to file offsets through program headers. goblin
+//! then reads them from file offset 0 (the ELF header) and fails, or returns garbage. In that case
+//! the tables are taken from the section headers instead (`.dynsym`, its linked string table, and
+//! the relocation sections linked to it), and the report carries a `parse_note` saying so.
+//!
 //! Roots (entry point, exported functions, functions whose address is taken) define reachability.
 //! syscall site not reachable from any root through direct calls is counted separately as possible
 //! dead code.
@@ -20,8 +27,10 @@
 use crate::constprop::analyze_range;
 use crate::sbpf::{Code, OP_LDDW, RelocCall, classify_calls};
 use crate::syscalls::{Syscall, by_name};
-use anyhow::{Context, Result};
-use goblin::elf::{Elf, header, program_header, section_header, sym};
+use anyhow::{Context, Result, bail};
+use goblin::container::{Container, Ctx};
+use goblin::elf::{Elf, dynamic, header, program_header, reloc::RelocSection, section_header, sym};
+use goblin::strtab::Strtab;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 const R_BPF_64_64: u32 = 1;
@@ -72,6 +81,8 @@ pub struct ElfReport {
     /// False if no entry point, exported function or address-taken function was found; reachability
     /// is then not meaningful and is not reported.
     pub roots_found: bool,
+    /// Non-empty when the ELF needed a fallback to be parsed (see module docs).
+    pub parse_note: String,
 }
 
 struct Range {
@@ -81,10 +92,35 @@ struct Range {
 }
 
 pub fn scan_elf(bytes: &[u8], table: &HashMap<u32, &'static Syscall>) -> Result<ElfReport> {
-    let elf = Elf::parse(bytes).context("ELF parse")?;
+    // goblin fails on unmappable dynamic tables; retry with the dynamic
+    // segment hidden, then read those tables from the section headers.
+    let patched;
+    let (mut elf, failed) = match Elf::parse(bytes) {
+        Ok(e) => (e, None),
+        Err(first) => {
+            patched = without_dynamic_segment(bytes)
+                .ok_or(first)
+                .context("ELF parse")?;
+            (
+                Elf::parse(&patched).context("ELF parse (dynamic segment hidden)")?,
+                Some(()),
+            )
+        }
+    };
+    let mut parse_note = String::new();
+    if failed.is_some() || !dynamic_tables_mapped(&elf) {
+        if dynamic_from_sections(bytes, &mut elf)? {
+            parse_note = "dynamic tables outside loaded segments; read from section headers".into();
+        } else if failed.is_some() {
+            bail!("ELF parse: dynamic tables outside loaded segments and no .dynsym section");
+        } else {
+            parse_note = "dynamic tables outside loaded segments and no .dynsym section; imports may be missing".into();
+        }
+    }
     let mut report = ElfReport {
         e_machine: elf.header.e_machine,
         e_flags: elf.header.e_flags,
+        parse_note,
         ..Default::default()
     };
     let ranges = executable_ranges(&elf, bytes.len());
@@ -146,8 +182,9 @@ pub fn scan_elf(bytes: &[u8], table: &HashMap<u32, &'static Syscall>) -> Result<
         }
     }
 
-    // Section relocations (relocatable objects and unusual binaries).
-    for (reloc_sec, relocs) in &elf.shdr_relocs {
+    // 2. Section relocations (relocatable objects only: in linked programs these
+    //    sections include .rel.dyn, already handled above with the right symbols).
+    for (reloc_sec, relocs) in elf.shdr_relocs.iter().filter(|_| is_rel) {
         let Some(target_sec) = elf
             .section_headers
             .get(*reloc_sec)
@@ -284,8 +321,138 @@ pub fn scan_elf(bytes: &[u8], table: &HashMap<u32, &'static Syscall>) -> Result<
     Ok(report)
 }
 
-/// Target of an R_BPF_64_RELATIVE relocation: an lddw immediate pair if the location is in code,
-/// otherwise a 64-bit value in data.
+const DYN_TABLE_TAGS: [u64; 4] = [
+    dynamic::DT_SYMTAB,
+    dynamic::DT_STRTAB,
+    dynamic::DT_REL,
+    dynamic::DT_RELA,
+];
+
+fn in_load_segment(elf: &Elf, vaddr: u64) -> bool {
+    elf.program_headers.iter().any(|ph| {
+        ph.p_type == program_header::PT_LOAD
+            && vaddr >= ph.p_vaddr
+            && vaddr - ph.p_vaddr < ph.p_memsz
+    })
+}
+
+/// True if every dynamic table address maps into a PT_LOAD segment (or there
+/// is no dynamic segment).
+fn dynamic_tables_mapped(elf: &Elf) -> bool {
+    elf.dynamic.as_ref().is_none_or(|d| {
+        d.dyns
+            .iter()
+            .filter(|e| DYN_TABLE_TAGS.contains(&e.d_tag))
+            .all(|e| in_load_segment(elf, e.d_val))
+    })
+}
+
+/// Copy of the ELF with its PT_DYNAMIC program header turned into PT_NULL, so
+/// goblin skips the dynamic segment. None if there is nothing to hide.
+fn without_dynamic_segment(bytes: &[u8]) -> Option<Vec<u8>> {
+    let header = Elf::parse_header(bytes).ok()?;
+    let mut out = bytes.to_vec();
+    let little = header.e_ident[header::EI_DATA] == header::ELFDATA2LSB;
+    let mut hidden = false;
+    for i in 0..header.e_phnum as usize {
+        let at = (header.e_phoff as usize).checked_add(i * header.e_phentsize as usize)?;
+        let field = out.get_mut(at..at + 4)?;
+        let p_type = if little {
+            u32::from_le_bytes(field.try_into().ok()?)
+        } else {
+            u32::from_be_bytes(field.try_into().ok()?)
+        };
+        if p_type == program_header::PT_DYNAMIC {
+            field.copy_from_slice(&[0; 4]); // PT_NULL
+            hidden = true;
+        }
+    }
+    hidden.then_some(out)
+}
+
+/// Replace goblin's dynamic symbols, strings and relocations with those found
+/// through section headers. Returns false if there is no `.dynsym` section.
+fn dynamic_from_sections<'a>(bytes: &'a [u8], elf: &mut Elf<'a>) -> Result<bool> {
+    let Some(dynsym_idx) = elf
+        .section_headers
+        .iter()
+        .position(|s| s.sh_type == section_header::SHT_DYNSYM)
+    else {
+        return Ok(false);
+    };
+    let ctx = Ctx::new(
+        if elf.is_64 {
+            Container::Big
+        } else {
+            Container::Little
+        },
+        if elf.little_endian {
+            goblin::container::Endian::Little
+        } else {
+            goblin::container::Endian::Big
+        },
+    );
+    let in_file = |off: u64, size: u64| {
+        off.checked_add(size)
+            .is_some_and(|end| end <= bytes.len() as u64)
+    };
+    let ds = &elf.section_headers[dynsym_idx];
+    let sym_size = if elf.is_64 { 24 } else { 16 };
+    if !in_file(ds.sh_offset, ds.sh_size) {
+        bail!(".dynsym section out of bounds");
+    }
+    let strs = elf
+        .section_headers
+        .get(ds.sh_link as usize)
+        .context(".dynsym sh_link out of range")?;
+    if !in_file(strs.sh_offset, strs.sh_size) {
+        bail!(".dynstr section out of bounds");
+    }
+    let dynsyms = sym::Symtab::parse(
+        bytes,
+        ds.sh_offset as usize,
+        (ds.sh_size / sym_size) as usize,
+        ctx,
+    )
+    .context(".dynsym")?;
+    let dynstrtab = Strtab::parse(bytes, strs.sh_offset as usize, strs.sh_size as usize, 0)
+        .context(".dynstr")?;
+
+    let mut dynrels = RelocSection::default();
+    let mut dynrelas = RelocSection::default();
+    for s in &elf.section_headers {
+        let is_rela = match s.sh_type {
+            section_header::SHT_REL => false,
+            section_header::SHT_RELA => true,
+            _ => continue,
+        };
+        if s.sh_link as usize != dynsym_idx || !in_file(s.sh_offset, s.sh_size) {
+            continue;
+        }
+        let r = RelocSection::parse(
+            bytes,
+            s.sh_offset as usize,
+            s.sh_size as usize,
+            is_rela,
+            ctx,
+        )
+        .context("dynamic relocation section")?;
+        if is_rela {
+            dynrelas = r;
+        } else {
+            dynrels = r;
+        }
+    }
+    elf.dynsyms = dynsyms;
+    elf.dynstrtab = dynstrtab;
+    elf.dynrels = dynrels;
+    elf.dynrelas = dynrelas;
+    elf.pltrelocs = RelocSection::default();
+    Ok(true)
+}
+
+/// Target of an R_BPF_64_RELATIVE relocation: an lddw immediate pair if the
+/// location is in code, otherwise a 64-bit value in data.
 fn relative_target(bytes: &[u8], elf: &Elf, ranges: &[Range], r_offset: u64) -> Option<u64> {
     let loc = vaddr_to_file(elf, r_offset)?;
     let read_u32 = |o: usize| {
@@ -354,4 +521,39 @@ fn executable_ranges(elf: &Elf, file_len: usize) -> Vec<Range> {
             .collect();
     }
     ranges
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::syscalls::hash_table;
+
+    // Generated by tests/gen_dyn_elf.py: `r1 = 1; call sol_curve_group_op; exit`
+    // with the call patched by a dynamic relocation.
+    const MAPPED: &[u8] = include_bytes!("../tests/fixtures/mapped.so");
+    const UNMAPPED: &[u8] = include_bytes!("../tests/fixtures/unmapped.so");
+
+    fn curve_hit(r: &ElfReport) -> &Hit {
+        &r.syscalls["sol_curve_group_op"]
+    }
+
+    #[test]
+    fn dynamic_tables_in_loaded_segment() {
+        let r = scan_elf(MAPPED, &hash_table()).unwrap();
+        assert!(r.parse_note.is_empty());
+        assert_eq!(curve_hit(&r).count, 1);
+        assert_eq!(curve_hit(&r).selectors, BTreeSet::from([1]));
+    }
+
+    #[test]
+    fn dynamic_tables_outside_loaded_segments_fall_back_to_sections() {
+        // goblin alone fails on this file (it reads the string table from offset 0).
+        assert!(Elf::parse(UNMAPPED).is_err());
+        let r = scan_elf(UNMAPPED, &hash_table()).unwrap();
+        assert!(r.parse_note.contains("section headers"));
+        let hit = curve_hit(&r);
+        assert!(hit.evidence.contains(&Evidence::Relocation));
+        assert_eq!(hit.count, 1);
+        assert_eq!(hit.selectors, BTreeSet::from([1]));
+    }
 }
