@@ -25,6 +25,7 @@
 //! dead code.
 
 use crate::constprop::analyze_range;
+use crate::precompile::{self, DataRegion, RefBytes};
 use crate::sbpf::{Code, OP_LDDW, RelocCall, classify_calls};
 use crate::syscalls::{Syscall, by_name};
 use anyhow::{Context, Result, bail};
@@ -91,7 +92,11 @@ struct Range {
     vaddr_start: u64,
 }
 
-pub fn scan_elf(bytes: &[u8], table: &HashMap<u32, &'static Syscall>) -> Result<ElfReport> {
+pub fn scan_elf(
+    bytes: &[u8],
+    table: &HashMap<u32, &'static Syscall>,
+    rbs: &[RefBytes],
+) -> Result<ElfReport> {
     // goblin fails on unmappable dynamic tables; retry with the dynamic
     // segment hidden, then read those tables from the section headers.
     let patched;
@@ -124,6 +129,8 @@ pub fn scan_elf(bytes: &[u8], table: &HashMap<u32, &'static Syscall>) -> Result<
         ..Default::default()
     };
     let ranges = executable_ranges(&elf, bytes.len());
+    let regions = data_regions(&elf, bytes);
+    let located_ids = precompile::locate_ids(&regions, bytes, &rbs);
     let is_rel = elf.header.e_type == header::ET_REL;
     let section_off = |shndx: usize| elf.section_headers.get(shndx).map(|s| s.sh_offset as usize);
 
@@ -182,8 +189,8 @@ pub fn scan_elf(bytes: &[u8], table: &HashMap<u32, &'static Syscall>) -> Result<
         }
     }
 
-    // 2. Section relocations (relocatable objects only: in linked programs these
-    //    sections include .rel.dyn, already handled above with the right symbols).
+    // Section relocations (relocatable objects only: in linked programs these sections include
+    // .rel.dyn, already handled above with the right symbols).
     for (reloc_sec, relocs) in elf.shdr_relocs.iter().filter(|_| is_rel) {
         let Some(target_sec) = elf
             .section_headers
@@ -492,17 +499,19 @@ fn vaddr_to_file(elf: &Elf, vaddr: u64) -> Option<usize> {
     None
 }
 
+fn make_range(file_len: usize, off: u64, size: u64, vaddr: u64) -> Option<Range> {
+    let file_start = (off as usize).min(file_len);
+    let file_end = (off.saturating_add(size) as usize).min(file_len);
+    (file_end > file_start).then_some(Range {
+        file_start,
+        file_end,
+        vaddr_start: vaddr,
+    })
+}
+
 /// Executable PT_LOAD segments, falling back to SHF_EXECINSTR sections.
 fn executable_ranges(elf: &Elf, file_len: usize) -> Vec<Range> {
-    let make = |off: u64, size: u64, vaddr: u64| {
-        let file_start = (off as usize).min(file_len);
-        let file_end = (off.saturating_add(size) as usize).min(file_len);
-        (file_end > file_start).then_some(Range {
-            file_start,
-            file_end,
-            vaddr_start: vaddr,
-        })
-    };
+    let make = |off: u64, size: u64, vaddr: u64| make_range(file_len, off, size, vaddr);
     let mut ranges: Vec<Range> = elf
         .program_headers
         .iter()
@@ -523,6 +532,51 @@ fn executable_ranges(elf: &Elf, file_len: usize) -> Vec<Range> {
     ranges
 }
 
+/// Address of section `index` as the analysis sees it: `sh_addr` in a linked program. In a
+/// relocatable object, where every `sh_addr` is 0, a synthetic base of `index << 32` so that
+/// sections do not overlap. `None` for the null section, reserved indexes SHN_ABS, SHN_COMMON, ...
+/// and out-of-range indexes.
+fn section_address(elf: &Elf, index: usize) -> Option<u64> {
+    let sh = elf.section_headers.get(index).filter(|_| index != 0)?;
+    if elf.header.e_type == header::ET_REL {
+        Some((index as u64) << 32)
+    } else {
+        Some(sh.sh_addr)
+    }
+}
+
+fn data_regions<'a>(elf: &Elf, bytes: &'a [u8]) -> Vec<DataRegion<'a>> {
+    let make = |off: u64, size: u64, vaddr: u64| make_range(bytes.len(), off, size, vaddr);
+    let reg = |r: Range| DataRegion {
+        bytes: &bytes[r.file_start..r.file_end],
+        address: r.vaddr_start,
+    };
+
+    let regs: Vec<DataRegion> = if !elf.section_headers.is_empty() {
+        elf.section_headers
+            .iter()
+            .enumerate()
+            .filter(|(_, sh)| {
+                sh.sh_flags & u64::from(section_header::SHF_ALLOC) != 0
+                    && sh.sh_flags & u64::from(section_header::SHF_EXECINSTR) == 0
+                    && sh.sh_type != section_header::SHT_NOBITS
+            })
+            .filter_map(|(i, sh)| make(sh.sh_offset, sh.sh_size, section_address(elf, i)?))
+            .map(reg)
+            .collect()
+    } else {
+        elf.program_headers
+            .iter()
+            .filter(|ph| {
+                ph.p_type == program_header::PT_LOAD && ph.p_flags & program_header::PF_X == 0
+            })
+            .filter_map(|ph| make(ph.p_offset, ph.p_filesz, ph.p_vaddr))
+            .map(reg)
+            .collect()
+    };
+    regs
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -539,7 +593,7 @@ mod tests {
 
     #[test]
     fn dynamic_tables_in_loaded_segment() {
-        let r = scan_elf(MAPPED, &hash_table()).unwrap();
+        let r = scan_elf(MAPPED, &hash_table(), &[]).unwrap();
         assert!(r.parse_note.is_empty());
         assert_eq!(curve_hit(&r).count, 1);
         assert_eq!(curve_hit(&r).selectors, BTreeSet::from([1]));
@@ -549,7 +603,7 @@ mod tests {
     fn dynamic_tables_outside_loaded_segments_fall_back_to_sections() {
         // goblin alone fails on this file (it reads the string table from offset 0).
         assert!(Elf::parse(UNMAPPED).is_err());
-        let r = scan_elf(UNMAPPED, &hash_table()).unwrap();
+        let r = scan_elf(UNMAPPED, &hash_table(), &[]).unwrap();
         assert!(r.parse_note.contains("section headers"));
         let hit = curve_hit(&r);
         assert!(hit.evidence.contains(&Evidence::Relocation));

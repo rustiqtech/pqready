@@ -115,8 +115,8 @@ fn class_of(name: &str) -> &'static str {
 fn scan_one(path: &Path) -> Result<()> {
     let bytes = fs::read(path).with_context(|| path.display().to_string())?;
     let table = syscalls::hash_table();
-    let refs = precompile::decoded_refs();
-    let r = elf::scan_elf(&bytes, &table)?;
+    let rbs = precompile::decoded_refs();
+    let r = elf::scan_elf(&bytes, &table, &rbs)?;
     println!(
         "e_machine={} e_flags={:#x} functions={} indirect_calls={} roots_found={}",
         r.e_machine, r.e_flags, r.functions, r.indirect_calls, r.roots_found
@@ -139,7 +139,7 @@ fn scan_one(path: &Path) -> Result<()> {
     for (h, n) in &r.unresolved_static_hashes {
         println!("unresolved static call hash {h:#010x} x{n}");
     }
-    for (rf, n) in precompile::find_refs(&bytes, &refs) {
+    for (rf, n) in precompile::find_refs(&bytes, &rbs) {
         println!("precompile ref {:<28} x{n}", rf.name);
     }
     Ok(())
@@ -148,7 +148,7 @@ fn scan_one(path: &Path) -> Result<()> {
 fn scan_all(raw: &Path, out: &Path) -> Result<()> {
     fs::create_dir_all(out)?;
     let table = syscalls::hash_table();
-    let refs = precompile::decoded_refs();
+    let rbs = precompile::decoded_refs();
 
     // Programs with a downloaded ELF (closed, retracted or skipped ones have none).
     let mut programs = Vec::new();
@@ -168,7 +168,7 @@ fn scan_all(raw: &Path, out: &Path) -> Result<()> {
     let results: Vec<(SummaryRow, Vec<DepRow>)> = programs
         .par_iter()
         .map(|p| {
-            let r = scan_program(p, raw, &table, &refs);
+            let r = scan_program(p, raw, &table, &rbs);
             let n = done.fetch_add(1, Ordering::Relaxed) + 1;
             if n % step == 0 || n == total {
                 eprintln!("scanned {n}/{total}");
@@ -205,7 +205,7 @@ fn scan_program(
     p: &fetch::ProgramRow,
     raw: &Path,
     table: &HashMap<u32, &'static syscalls::Syscall>,
-    needles: &[precompile::RefBytes],
+    rbs: &[precompile::RefBytes],
 ) -> (SummaryRow, Vec<DepRow>) {
     let mut s = SummaryRow {
         program_id: p.program_id.clone(),
@@ -246,23 +246,23 @@ fn scan_program(
         }
     };
 
-    // Precompile references are byte matches, so they work even if ELF parsing fails.
-    for (rf, n) in precompile::find_refs(&bytes, needles) {
-        if rf.vulnerable {
-            s.vulnerable_precompile_refs += 1;
-        }
-        let class = if rf.vulnerable {
-            "quantum_vulnerable"
-        } else {
-            "marker"
-        };
-        deps.push(DepRow {
-            count: n,
-            ..dep("precompile_ref", rf.name, class, "rodata_bytes".into())
-        });
-    }
+    // // Precompile references are byte matches, so they work even if ELF parsing fails.
+    // for (rf, n) in precompile::find_refs(&bytes, rbs) {
+    //     if rf.vulnerable {
+    //         s.vulnerable_precompile_refs += 1;
+    //     }
+    //     let class = if rf.vulnerable {
+    //         "quantum_vulnerable"
+    //     } else {
+    //         "marker"
+    //     };
+    //     deps.push(DepRow {
+    //         count: n,
+    //         ..dep("precompile_ref", rf.name, class, "rodata_bytes".into())
+    //     });
+    // }
 
-    match elf::scan_elf(&bytes, table) {
+    match elf::scan_elf(&bytes, table, rbs) {
         Ok(r) => {
             s.parse_ok = true;
             s.e_machine = Some(r.e_machine);
