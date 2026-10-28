@@ -139,8 +139,14 @@ fn scan_one(path: &Path) -> Result<()> {
     for (h, n) in &r.unresolved_static_hashes {
         println!("unresolved static call hash {h:#010x} x{n}");
     }
-    for (rf, n) in precompile::find_refs(&bytes, &rbs) {
-        println!("precompile ref {:<28} x{n}", rf.name);
+    for id in r.located_ids.iter().filter(|id| id.in_file) {
+        let addrs: Vec<String> = id.addresses.iter().map(|a| format!("{a:#x}")).collect();
+        println!(
+            "precompile id {:<28} addresses={} [{}]",
+            id.r.name,
+            id.addresses.len(),
+            addrs.join(", ")
+        );
     }
     Ok(())
 }
@@ -302,6 +308,20 @@ fn scan_program(
                 });
             }
             s.unknown_imports = unknown.join(";");
+
+            // where each ID's bytes occur, presence only
+            for id in r.located_ids.iter().filter(|id| id.in_file) {
+                let (evidence, count) = if id.addresses.is_empty() {
+                    ("bytes_outside_data", 1)
+                } else {
+                    ("bytes_in_data", id.addresses.len())
+                };
+                let class = if id.r.vulnerable { "review" } else { "marker" };
+                deps.push(DepRow {
+                    count,
+                    ..dep("precompile_ref", id.r.name, class, evidence.into())
+                });
+            }
         }
         Err(e) => s.error = format!("{e:#}"),
     }

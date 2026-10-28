@@ -25,7 +25,7 @@
 //! dead code.
 
 use crate::constprop::analyze_range;
-use crate::precompile::{self, DataRegion, RefBytes};
+use crate::precompile::{self, DataRegion, LocatedId, RefBytes};
 use crate::sbpf::{Code, OP_LDDW, RelocCall, classify_calls};
 use crate::syscalls::{Syscall, by_name};
 use anyhow::{Context, Result, bail};
@@ -84,6 +84,7 @@ pub struct ElfReport {
     pub roots_found: bool,
     /// Non-empty when the ELF needed a fallback to be parsed (see module docs).
     pub parse_note: String,
+    pub located_ids: Vec<LocatedId>,
 }
 
 struct Range {
@@ -130,7 +131,7 @@ pub fn scan_elf(
     };
     let ranges = executable_ranges(&elf, bytes.len());
     let regions = data_regions(&elf, bytes);
-    let located_ids = precompile::locate_ids(&regions, bytes, &rbs);
+    report.located_ids = precompile::locate_ids(&regions, bytes, &rbs);
     let is_rel = elf.header.e_type == header::ET_REL;
     let section_off = |shndx: usize| elf.section_headers.get(shndx).map(|s| s.sh_offset as usize);
 
@@ -509,27 +510,30 @@ fn make_range(file_len: usize, off: u64, size: u64, vaddr: u64) -> Option<Range>
     })
 }
 
-/// Executable PT_LOAD segments, falling back to SHF_EXECINSTR sections.
+/// Code to decode: executable sections when the file has section headers, otherwise executable
+/// PT_LOAD segments. Sections come first because an executable segment may also hold read-only data
+/// or headers, which would be decoded as spurious instructions.
 fn executable_ranges(elf: &Elf, file_len: usize) -> Vec<Range> {
     let make = |off: u64, size: u64, vaddr: u64| make_range(file_len, off, size, vaddr);
-    let mut ranges: Vec<Range> = elf
-        .program_headers
-        .iter()
-        .filter(|ph| ph.p_type == program_header::PT_LOAD && ph.p_flags & program_header::PF_X != 0)
-        .filter_map(|ph| make(ph.p_offset, ph.p_filesz, ph.p_vaddr))
-        .collect();
-    if ranges.is_empty() {
-        ranges = elf
-            .section_headers
+    if !elf.section_headers.is_empty() {
+        elf.section_headers
             .iter()
-            .filter(|sh| {
+            .enumerate()
+            .filter(|(_, sh)| {
                 sh.sh_flags & u64::from(section_header::SHF_EXECINSTR) != 0
                     && sh.sh_type != section_header::SHT_NOBITS
             })
-            .filter_map(|sh| make(sh.sh_offset, sh.sh_size, sh.sh_addr))
-            .collect();
+            .filter_map(|(i, sh)| make(sh.sh_offset, sh.sh_size, section_address(elf, i)?))
+            .collect()
+    } else {
+        elf.program_headers
+            .iter()
+            .filter(|ph| {
+                ph.p_type == program_header::PT_LOAD && ph.p_flags & program_header::PF_X != 0
+            })
+            .filter_map(|ph| make(ph.p_offset, ph.p_filesz, ph.p_vaddr))
+            .collect()
     }
-    ranges
 }
 
 /// Address of section `index` as the analysis sees it: `sh_addr` in a linked program. In a
