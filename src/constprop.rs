@@ -55,7 +55,7 @@ fn join(a: &Val, b: &Val) -> Val {
 
 type Regs = Vec<Val>; // r0..=r10
 
-fn transfer(i: &Instr, s: &Regs) -> Regs {
+fn transfer(i: &Instr, s: &Regs, model_alu: bool) -> Regs {
     let mut o = s.clone();
     let d = i.dst as usize;
     let src = i.src as usize;
@@ -75,6 +75,17 @@ fn transfer(i: &Instr, s: &Regs) -> Regs {
         }
         sbpf::OP_CALL | sbpf::OP_CALLX => o[0..=5].fill(Val::Unknown),
         sbpf::OP_EXIT | sbpf::OP_RETURN | sbpf::OP_JA => {}
+        // 64-bit add/sub; the 32-bit immediate is sign-extended (sbpf interpreter: `i.imm as
+        // u64` with a sign-extended imm).
+        sbpf::OP_ADD64_IMM if writable && model_alu => {
+            o[d] = map_consts(&s[d], |c| c.wrapping_add(i64::from(i.imm)))
+        }
+        sbpf::OP_SUB64_IMM if writable && model_alu => {
+            o[d] = map_consts(&s[d], |c| c.wrapping_sub(i64::from(i.imm)))
+        }
+        sbpf::OP_ADD64_REG if writable && model_alu => {
+            o[d] = add_sets(&s[d], s.get(src).unwrap_or(&Val::Unknown))
+        }
         opc if sbpf::is_cond_jump(opc) || sbpf::is_store(opc) => {}
         _ if writable => o[d] = Val::Unknown,
         _ => {}
@@ -99,7 +110,7 @@ pub fn analyze_function(code: &Code, calls: &HashMap<usize, Call>, entry: usize)
     let mut work = vec![entry];
     let mut succ = Vec::new();
     while let Some(idx) = work.pop() {
-        let out = transfer(&code.instrs[idx], &state[&idx]);
+        let out = transfer(&code.instrs[idx], &state[&idx], code.model_alu);
         sbpf::successors(code, idx, &mut succ);
         for &n in &succ {
             match state.get_mut(&n) {
@@ -278,6 +289,27 @@ pub fn analyze_range(
     out
 }
 
+/// Apply `f` to every constant; anything but a constant set becomes unknown.
+fn map_consts(v: &Val, f: impl Fn(i64) -> i64) -> Val {
+    match v {
+        Val::Consts(set) => Val::Consts(set.iter().map(|&c| f(c)).collect()),
+        _ => Val::Unknown,
+    }
+}
+
+/// All pairwise sums of two constant sets, or unknown if either is not a constant set or the result
+/// would exceed `MAX_SET`.
+fn add_sets(a: &Val, b: &Val) -> Val {
+    match (a, b) {
+        (Val::Consts(x), Val::Consts(y)) if x.len() * y.len() <= MAX_SET => Val::Consts(
+            x.iter()
+                .flat_map(|&p| y.iter().map(move |&q| p.wrapping_add(q)))
+                .collect(),
+        ),
+        _ => Val::Unknown,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -310,7 +342,8 @@ mod tests {
 
     fn run(prog: &[[u8; 8]], root_slots: &[usize]) -> RangeResult {
         let text: Vec<u8> = prog.concat();
-        let code = Code::decode(&text, 0, 0);
+        let mut code = Code::decode(&text, 0, 0);
+        code.model_alu = true;
         let calls = classify_calls(&code, &HashMap::new(), &hash_table());
         let roots = root_slots
             .iter()
@@ -451,5 +484,85 @@ mod tests {
         let r = run(&prog, &[0]);
         assert_eq!(r.unresolved.len(), 1);
         assert_eq!(r.indirect_calls, 1);
+    }
+
+    /// `lddw dst, v` as its two slots.
+    fn lddw(dst: u8, v: i64) -> [[u8; 8]; 2] {
+        let mut hi = [0u8; 8];
+        hi[4..8].copy_from_slice(&((v >> 32) as i32).to_le_bytes());
+        [instr(sbpf::OP_LDDW, dst, 0, 0, v as i32), hi]
+    }
+
+    /// r1 at a curve call appended after `prog`, with add/sub modelled or not.
+    fn r1_with(prog: &[[u8; 8]], model_alu: bool) -> Option<Vec<i64>> {
+        let mut text: Vec<u8> = prog.concat();
+        text.extend_from_slice(&syscall(CURVE));
+        text.extend_from_slice(&exit());
+        let mut code = Code::decode(&text, 0, 0);
+        code.model_alu = model_alu;
+        let calls = classify_calls(&code, &HashMap::new(), &hash_table());
+        let r = analyze_range(&code, &calls, &BTreeSet::from([0]));
+        r.sites[0]
+            .selectors
+            .as_ref()
+            .map(|s| s.iter().copied().collect())
+    }
+
+    /// A typical synthetic address (section 4, offset 0x100): above 32 bits.
+    const X: i64 = 0x4_0000_0100;
+
+    #[test]
+    fn add_immediate_to_constant() {
+        let [a, b] = lddw(1, X);
+        let prog = [a, b, instr(sbpf::OP_ADD64_IMM, 1, 0, 0, 0x20)];
+        assert_eq!(r1_with(&prog, true), Some(vec![X + 0x20]));
+    }
+
+    #[test]
+    fn add_immediate_is_sign_extended() {
+        let [a, b] = lddw(1, X);
+        let prog = [a, b, instr(sbpf::OP_ADD64_IMM, 1, 0, 0, -8)];
+        assert_eq!(r1_with(&prog, true), Some(vec![X - 8]));
+    }
+
+    #[test]
+    fn sub_immediate_only_where_modelled() {
+        let [a, b] = lddw(1, X);
+        let prog = [a, b, instr(sbpf::OP_SUB64_IMM, 1, 0, 0, 8)];
+        assert_eq!(r1_with(&prog, true), Some(vec![X - 8]));
+        assert_eq!(r1_with(&prog, false), None);
+    }
+
+    #[test]
+    fn add_register_gives_pairwise_sums() {
+        // r3 is 0 or 32 depending on a branch; then r1 = X + r3.
+        let [a, b] = lddw(1, X);
+        let prog = [
+            a, // slots 0-1: lddw r1, X
+            b,
+            instr(0x15, 2, 0, 2, 0),        // slot 2: if r2 == 0 goto 5
+            mov(3, 32),                     // slot 3
+            instr(sbpf::OP_JA, 0, 0, 1, 0), // slot 4: goto 6
+            mov(3, 0),                      // slot 5
+            instr(sbpf::OP_ADD64_REG, 1, 3, 0, 0), // slot 6: r1 += r3
+        ];
+        assert_eq!(r1_with(&prog, true), Some(vec![X, X + 32]));
+    }
+
+    #[test]
+    fn add_to_parameter_is_unknown() {
+        // r1 on entry is a parameter of the root function (Entry(1)), not a constant.
+        let prog = [instr(sbpf::OP_ADD64_IMM, 1, 0, 0, 0x20)];
+        assert_eq!(r1_with(&prog, true), None);
+    }
+
+    #[test]
+    fn sbpf_versions_with_v0_alu_semantics() {
+        for v in [0, 1, 3, 4] {
+            assert!(sbpf::models_alu(v), "e_flags {v}");
+        }
+        for v in [2, 5, 0x20] {
+            assert!(!sbpf::models_alu(v), "e_flags {v}");
+        }
     }
 }

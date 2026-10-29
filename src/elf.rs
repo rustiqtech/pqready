@@ -26,7 +26,7 @@
 
 use crate::constprop::analyze_range;
 use crate::precompile::{self, DataRegion, LocatedId, RefBytes};
-use crate::sbpf::{Code, OP_LDDW, RelocCall, classify_calls};
+use crate::sbpf::{Code, OP_LDDW, RelocCall, classify_calls, models_alu};
 use crate::syscalls::{Syscall, by_name};
 use anyhow::{Context, Result, bail};
 use goblin::container::{Container, Ctx};
@@ -283,6 +283,7 @@ pub fn scan_elf(
                 r.file_start,
                 r.vaddr_start,
             );
+            code.model_alu = models_alu(elf.header.e_flags);
             let base = code.file_base;
             for i in code
                 .instrs

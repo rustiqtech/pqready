@@ -22,6 +22,9 @@ pub const OP_MOV64_IMM: u8 = 0xb7;
 pub const OP_MOV32_IMM: u8 = 0xb4;
 pub const OP_MOV64_REG: u8 = 0xbf;
 pub const OP_MOV32_REG: u8 = 0xbc;
+pub const OP_ADD64_IMM: u8 = 0x07;
+pub const OP_SUB64_IMM: u8 = 0x17;
+pub const OP_ADD64_REG: u8 = 0x0f;
 
 const CLASS_MASK: u8 = 0x07;
 const CLASS_ST: u8 = 0x02;
@@ -49,6 +52,9 @@ pub struct Code {
     pub vaddr_base: u64,
     pub instrs: Vec<Instr>,
     by_slot: HashMap<usize, usize>,
+    /// Model 64-bit add/sub (see `models_alu`). False until the caller, which knows the SBPF
+    /// version, sets it: unknown versions stay conservative.
+    pub model_alu: bool,
 }
 
 impl Code {
@@ -85,6 +91,7 @@ impl Code {
             vaddr_base,
             instrs,
             by_slot,
+            model_alu: false,
         }
     }
 
@@ -205,4 +212,12 @@ pub fn successors(code: &Code, idx: usize, out: &mut Vec<usize>) {
         }
         _ => out.extend(fall()),
     }
+}
+
+/// Whether the 64-bit add/sub encodings of this SBPF version (from `e_flags`) mean what they mean
+/// in V0. False for V2, which swaps the operands of `sub` with an immediate and reassigns
+/// instruction classes, and for values sbpf treats as reserved. Source: sbpf `program.rs`
+/// (SBPFVersion features) and `elf.rs` (`e_flags` mapping).
+pub fn models_alu(e_flags: u32) -> bool {
+    matches!(e_flags, 0 | 1 | 3 | 4)
 }
