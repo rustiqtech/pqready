@@ -98,7 +98,82 @@ pub struct FnInfo {
     /// (call instruction, callee entry, r1..=r5 at the call)
     pub call_args: Vec<(usize, usize, Vec<Val>)>,
     /// (syscall instruction, r1 at the call)
+    // FIXME: now duplicates calls[..][0] for syscalls and needs code cleanup
     pub syscall_r1: HashMap<usize, Val>,
+    /// Register values just before selected instructions, still in terms of this function's
+    /// parameters (resolved across callers in `analyze_range`).
+    pub raw: RawSnapshots,
+}
+
+/// Values recorded within one function, before resolving parameters.
+#[derive(Debug, Default)]
+pub struct RawSnapshots {
+    /// Every call: r1, r2, r3.
+    pub calls: BTreeMap<usize, [Val; 3]>,
+    /// Every conditional jump: its two operands (dst; src register or immediate).
+    pub jumps: BTreeMap<usize, [Val; 2]>,
+    /// 64-bit xor (register or immediate): its two operands.
+    pub xors: BTreeMap<usize, [Val; 2]>,
+    /// Every store: address (base + offset), stored value, size in bytes.
+    pub stores: BTreeMap<usize, (Val, Val, u8)>,
+}
+
+/// Values recorded within one reachable function, parameters resolved: a set
+/// of constants, or None where some path gives a non-constant value.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct FnSnapshots {
+    pub calls: BTreeMap<usize, [Option<Set>; 3]>,
+    pub jumps: BTreeMap<usize, [Option<Set>; 2]>,
+    pub xors: BTreeMap<usize, [Option<Set>; 2]>,
+    pub stores: BTreeMap<usize, Store>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Store {
+    pub addr: Option<Set>,
+    pub value: Option<Set>,
+    pub size: u8,
+}
+
+const OP_XOR64_IMM: u8 = 0xa7;
+const OP_XOR64_REG: u8 = 0xaf;
+
+/// Size in bytes of a plain store (BPF_MEM mode), or None for any other opcode.
+/// ST (immediate value): 0x62 w, 0x6a h, 0x72 b, 0x7a dw; STX (register value):
+/// 0x63, 0x6b, 0x73, 0x7b. Atomic and other modes are not stores here.
+fn store_size(opc: u8) -> Option<u8> {
+    match opc {
+        0x62 | 0x63 => Some(4),
+        0x6a | 0x6b => Some(2),
+        0x72 | 0x73 => Some(1),
+        0x7a | 0x7b => Some(8),
+        _ => None,
+    }
+}
+
+/// Record the values `raw` keeps for instruction `idx`, from the state `s` just before it executes.
+fn record(code: &Code, calls: &HashMap<usize, Call>, idx: usize, s: &Regs, raw: &mut RawSnapshots) {
+    let i = &code.instrs[idx];
+    let reg = |r: u8| s.get(r as usize).cloned().unwrap_or(Val::Unknown);
+    let src_operand = || {
+        if i.opc & 0x08 != 0 {
+            reg(i.src)
+        } else {
+            consts(i64::from(i.imm))
+        }
+    };
+    if calls.contains_key(&idx) {
+        raw.calls.insert(idx, [reg(1), reg(2), reg(3)]);
+    } else if sbpf::is_cond_jump(i.opc) {
+        raw.jumps.insert(idx, [reg(i.dst), src_operand()]);
+    } else if !code.model_alu {
+        // Store and xor encodings differ in V2; record nothing rather than guess.
+    } else if matches!(i.opc, OP_XOR64_IMM | OP_XOR64_REG) {
+        raw.xors.insert(idx, [reg(i.dst), src_operand()]);
+    } else if let Some(size) = store_size(i.opc) {
+        let addr = map_consts(&reg(i.dst), |b| b.wrapping_add(i64::from(i.off)));
+        raw.stores.insert(idx, (addr, src_operand(), size));
+    }
 }
 
 pub fn analyze_function(code: &Code, calls: &HashMap<usize, Call>, entry: usize) -> FnInfo {
@@ -132,9 +207,11 @@ pub fn analyze_function(code: &Code, calls: &HashMap<usize, Call>, entry: usize)
         reached: BTreeSet::new(),
         call_args: Vec::new(),
         syscall_r1: HashMap::new(),
+        raw: Default::default(),
     };
     for (&idx, s) in &state {
         info.reached.insert(idx);
+        record(code, calls, idx, s, &mut info.raw);
         match calls.get(&idx) {
             Some(Call::Syscall { .. }) => {
                 info.syscall_r1.insert(idx, s[1].clone());
@@ -164,6 +241,8 @@ pub struct RangeResult {
     pub unresolved: BTreeMap<u32, usize>,
     pub indirect_calls: usize,
     pub functions: usize,
+    /// Recorded values per reachable function (keyed by its entry instruction).
+    pub snapshots: BTreeMap<usize, FnSnapshots>,
 }
 
 /// Unknown entry values are None; Some(set) is the union so far.
@@ -255,6 +334,44 @@ pub fn analyze_range(
         functions: fns.len(),
         ..Default::default()
     };
+    // Snapshots of reachable functions, with parameters resolved through the values their callers
+    // pass. An empty set (no caller contributes) is unknown.
+    let res = |v: &Val, e: &EntryVals| resolve(v, e).filter(|s| !s.is_empty());
+    for f in &reachable_fns {
+        let (raw, e) = (&fns[f].raw, &ev[f]);
+        let snap = FnSnapshots {
+            calls: raw
+                .calls
+                .iter()
+                .map(|(&k, [a, b, c])| (k, [res(a, e), res(b, e), res(c, e)]))
+                .collect(),
+            jumps: raw
+                .jumps
+                .iter()
+                .map(|(&k, [a, b])| (k, [res(a, e), res(b, e)]))
+                .collect(),
+            xors: raw
+                .xors
+                .iter()
+                .map(|(&k, [a, b])| (k, [res(a, e), res(b, e)]))
+                .collect(),
+            stores: raw
+                .stores
+                .iter()
+                .map(|(&k, (a, v, size))| {
+                    (
+                        k,
+                        Store {
+                            addr: res(a, e),
+                            value: res(v, e),
+                            size: *size,
+                        },
+                    )
+                })
+                .collect(),
+        };
+        out.snapshots.insert(*f, snap);
+    }
     for (&idx, call) in calls {
         match call {
             Call::Syscall { name, via_reloc } => {
@@ -564,5 +681,142 @@ mod tests {
         for v in [2, 5, 0x20] {
             assert!(!sbpf::models_alu(v), "e_flags {v}");
         }
+    }
+
+    const MEMCMP: &str = "sol_memcmp_";
+
+    /// Analyse `prog` with roots at `root_slots`.
+    fn snaps(prog: &[[u8; 8]], root_slots: &[usize], model_alu: bool) -> (Code, RangeResult) {
+        let text: Vec<u8> = prog.concat();
+        let mut code = Code::decode(&text, 0, 0);
+        code.model_alu = model_alu;
+        let calls = classify_calls(&code, &HashMap::new(), &hash_table());
+        let roots = root_slots
+            .iter()
+            .map(|s| code.idx_at_slot(*s as i64).unwrap())
+            .collect();
+        let r = analyze_range(&code, &calls, &roots);
+        (code, r)
+    }
+
+    fn set(v: &[i64]) -> Option<Set> {
+        Some(v.iter().copied().collect())
+    }
+
+    fn at_slot(code: &Code, slot: usize) -> usize {
+        code.idx_at_slot(slot as i64).unwrap()
+    }
+
+    #[test]
+    fn call_records_r1_to_r3() {
+        let [a, b] = lddw(2, X);
+        // slots 0-1: lddw r2, X; 2: r3 = 32; 3: call sol_memcmp_; 4: exit
+        let prog = [a, b, mov(3, 32), syscall(MEMCMP), exit()];
+        let (code, r) = snaps(&prog, &[0], true);
+        let calls = &r.snapshots[&0].calls;
+        // r1 is a parameter of the exported root, so unknown.
+        assert_eq!(calls[&at_slot(&code, 3)], [None, set(&[X]), set(&[32])]);
+    }
+
+    #[test]
+    fn parameter_resolved_through_caller() {
+        // root: lddw r1, X; call W; exit.  W (slot 4): r3 = 32; call sol_memcmp_; exit
+        let [a, b] = lddw(1, X);
+        let prog = [
+            a,
+            b,
+            call_to(2, 4),
+            exit(),
+            mov(3, 32),
+            syscall(MEMCMP),
+            exit(),
+        ];
+        let (code, r) = snaps(&prog, &[0], true);
+        let w = &r.snapshots[&at_slot(&code, 4)];
+        assert_eq!(w.calls[&at_slot(&code, 5)][0], set(&[X]));
+    }
+
+    #[test]
+    fn conditional_jump_operands_immediate_and_register() {
+        let [a, b] = lddw(2, X);
+        // 0: if r1 == 7 goto 1; 1-2: lddw r2, X; 3: if r1 != r2 goto 4; 4: exit
+        let prog = [
+            instr(0x15, 1, 0, 0, 7),
+            a,
+            b,
+            instr(0x5d, 1, 2, 0, 0),
+            exit(),
+        ];
+        let (code, r) = snaps(&prog, &[0], true);
+        let jumps = &r.snapshots[&0].jumps;
+        assert_eq!(jumps[&at_slot(&code, 0)], [None, set(&[7])]);
+        assert_eq!(jumps[&at_slot(&code, 3)], [None, set(&[X])]);
+    }
+
+    #[test]
+    fn xor_operands() {
+        let [a, b] = lddw(2, X);
+        // 0-1: lddw r2, X; 2: r1 ^= r2; 3: exit
+        let prog = [a, b, instr(OP_XOR64_REG, 1, 2, 0, 0), exit()];
+        let (code, r) = snaps(&prog, &[0], true);
+        assert_eq!(r.snapshots[&0].xors[&at_slot(&code, 2)], [None, set(&[X])]);
+    }
+
+    #[test]
+    fn stores_record_address_value_and_size() {
+        let [a, b] = lddw(1, X);
+        // 0-1: lddw r1, X; 2: r2 = 5; 3: *(u64 *)(r1 + 8) = r2; 4: *(u32 *)(r1 + 0) = 9; 5: exit
+        let prog = [
+            a,
+            b,
+            mov(2, 5),
+            instr(0x7b, 1, 2, 8, 0),
+            instr(0x62, 1, 0, 0, 9),
+            exit(),
+        ];
+        let (code, r) = snaps(&prog, &[0], true);
+        let stores = &r.snapshots[&0].stores;
+        assert_eq!(
+            stores[&at_slot(&code, 3)],
+            Store {
+                addr: set(&[X + 8]),
+                value: set(&[5]),
+                size: 8
+            }
+        );
+        assert_eq!(
+            stores[&at_slot(&code, 4)],
+            Store {
+                addr: set(&[X]),
+                value: set(&[9]),
+                size: 4
+            }
+        );
+    }
+
+    #[test]
+    fn stores_and_xors_not_recorded_where_encodings_differ() {
+        let [a, b] = lddw(1, X);
+        let prog = [
+            a,
+            b,
+            instr(0x7b, 1, 2, 8, 0),
+            instr(OP_XOR64_REG, 1, 2, 0, 0),
+            instr(0x15, 1, 0, 0, 7),
+            exit(),
+        ];
+        let (_, r) = snaps(&prog, &[0], false);
+        let s = &r.snapshots[&0];
+        assert!(s.stores.is_empty() && s.xors.is_empty());
+        assert_eq!(s.jumps.len(), 1, "jumps are still recorded");
+    }
+
+    #[test]
+    fn unreachable_function_has_no_snapshots() {
+        // root exits at once; slots 2-4 are never reached
+        let prog = [mov(0, 0), exit(), mov(3, 32), syscall(MEMCMP), exit()];
+        let (_, r) = snaps(&prog, &[0], true);
+        assert_eq!(r.snapshots.keys().copied().collect::<Vec<_>>(), vec![0]);
+        assert!(r.snapshots[&0].calls.is_empty());
     }
 }

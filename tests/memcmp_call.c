@@ -1,4 +1,5 @@
 // clang --target=bpf -O2 -fPIC -fno-builtin -c memcmp_call.c -o memcmp_call.o
+// clang --target=bpf -O2 -fPIC -c memcmp_call.c -o memcmp_inline.o
 
 extern int memcmp(const void *, const void *, unsigned long);
 

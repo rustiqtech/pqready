@@ -85,6 +85,10 @@ pub struct ElfReport {
     /// Non-empty when the ELF needed a fallback to be parsed (see module docs).
     pub parse_note: String,
     pub located_ids: Vec<LocatedId>,
+    /// Recorded register values per executable range, for tests only: the rules that use them run
+    /// inside `scan_elf`.
+    #[cfg(test)]
+    pub snapshots: Vec<std::collections::BTreeMap<usize, crate::constprop::FnSnapshots>>,
 }
 
 struct Range {
@@ -338,6 +342,9 @@ pub fn scan_elf(
         report.roots_found |= roots_found;
 
         let res = analyze_range(code, &calls, &roots);
+        #[cfg(test)]
+        report.snapshots.push(res.snapshots.clone());
+
         report.indirect_calls += res.indirect_calls;
         report.functions += res.functions;
         for (h, n) in res.unresolved {
@@ -786,5 +793,66 @@ mod tests {
         // instead gives address << 32 and the handler looks unreachable.
         let bytes = include_bytes!("../tests/fixtures/reldata.so");
         assert_eq!(curve_site(bytes), (0, 0, BTreeSet::from([1])));
+    }
+
+    #[cfg(test)]
+    mod snapshot_tests {
+        use super::*;
+        use crate::syscalls::hash_table;
+
+        fn ed25519() -> [u8; 32] {
+            bs58::decode("Ed25519SigVerify111111111111111111111111111")
+                .into_vec()
+                .unwrap()
+                .try_into()
+                .unwrap()
+        }
+
+        #[test]
+        fn memcmp_call_receives_the_id_address_and_length() {
+            // tests/fixtures/memcmp_call.c with -fno-builtin: memcmp(key, ED25519_ID, 32).
+            // ED25519_ID is at offset 0 of .rodata, section 4: address 4 << 32.
+            let bytes = include_bytes!("../tests/fixtures/memcmp_call.o");
+            let r = scan_elf(bytes, &hash_table(), &[]).unwrap();
+            let found = r
+                .snapshots
+                .iter()
+                .flat_map(|m| m.values())
+                .flat_map(|f| f.calls.values())
+                .any(|regs| {
+                    regs[1] == Some(BTreeSet::from([4i64 << 32]))
+                        && regs[2] == Some(BTreeSet::from([32]))
+                });
+            assert!(found, "{:#?}", r.snapshots);
+        }
+
+        #[test]
+        fn inlined_memcmp_compares_all_four_chunks_in_one_function() {
+            // Same source without -fno-builtin: clang inlines memcmp into four
+            // 64-bit comparisons against lddw constants.
+            let bytes = include_bytes!("../tests/fixtures/memcmp_inline.o");
+            let r = scan_elf(bytes, &hash_table(), &[]).unwrap();
+            let id = ed25519();
+            let chunks: Vec<i64> = (0..4)
+                .map(|k| i64::from_le_bytes(id[8 * k..8 * k + 8].try_into().unwrap()))
+                .collect();
+            let one_function_has_all = r.snapshots.iter().flat_map(|m| m.values()).any(|f| {
+                let operands: BTreeSet<i64> = f
+                    .jumps
+                    .values()
+                    .chain(f.xors.values())
+                    .flatten()
+                    .flatten()
+                    .flatten()
+                    .copied()
+                    .collect();
+                chunks.iter().all(|c| operands.contains(c))
+            });
+            assert!(
+                one_function_has_all,
+                "chunks {chunks:x?}\n{:#?}",
+                r.snapshots
+            );
+        }
     }
 }
