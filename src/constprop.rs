@@ -99,7 +99,7 @@ pub fn analyze_function(code: &Code, calls: &HashMap<usize, Call>, entry: usize)
     let mut work = vec![entry];
     let mut succ = Vec::new();
     while let Some(idx) = work.pop() {
-        let out = transfer(&code.insns[idx], &state[&idx]);
+        let out = transfer(&code.instrs[idx], &state[&idx]);
         sbpf::successors(code, idx, &mut succ);
         for &n in &succ {
             match state.get_mut(&n) {
@@ -286,7 +286,7 @@ mod tests {
 
     const CURVE: &str = "sol_curve_group_op";
 
-    fn insn(opc: u8, dst: u8, src: u8, off: i16, imm: i32) -> [u8; 8] {
+    fn instr(opc: u8, dst: u8, src: u8, off: i16, imm: i32) -> [u8; 8] {
         let mut b = [0u8; 8];
         b[0] = opc;
         b[1] = (src << 4) | (dst & 0x0f);
@@ -295,17 +295,17 @@ mod tests {
         b
     }
     fn mov(dst: u8, imm: i32) -> [u8; 8] {
-        insn(sbpf::OP_MOV64_IMM, dst, 0, 0, imm)
+        instr(sbpf::OP_MOV64_IMM, dst, 0, 0, imm)
     }
     fn syscall(name: &str) -> [u8; 8] {
-        insn(sbpf::OP_CALL, 0, 0, 0, syscall_hash(name) as i32)
+        instr(sbpf::OP_CALL, 0, 0, 0, syscall_hash(name) as i32)
     }
     /// Internal call (src = 1) from `slot` to `target`.
     fn call_to(slot: usize, target: usize) -> [u8; 8] {
-        insn(sbpf::OP_CALL, 0, 1, 0, target as i32 - slot as i32 - 1)
+        instr(sbpf::OP_CALL, 0, 1, 0, target as i32 - slot as i32 - 1)
     }
     fn exit() -> [u8; 8] {
-        insn(sbpf::OP_EXIT, 0, 0, 0, 0)
+        instr(sbpf::OP_EXIT, 0, 0, 0, 0)
     }
 
     fn run(prog: &[[u8; 8]], root_slots: &[usize]) -> RangeResult {
@@ -340,9 +340,9 @@ mod tests {
         // The last mov in file order is r1 = 0; the old linear sweep reported
         // only {0}. Both paths must be reported.
         let prog = [
-            insn(0x15, 2, 0, 2, 0), // jeq r2, 0: target 0 + 1 + 2 = 3
+            instr(0x15, 2, 0, 2, 0), // jeq r2, 0: target 0 + 1 + 2 = 3
             mov(1, 1),
-            insn(sbpf::OP_JA, 0, 0, 1, 0), // target 2 + 1 + 1 = 4
+            instr(sbpf::OP_JA, 0, 0, 1, 0), // target 2 + 1 + 1 = 4
             mov(1, 0),
             syscall(CURVE),
             exit(),
@@ -354,7 +354,7 @@ mod tests {
     #[test]
     fn value_from_unknown_source_is_unknown() {
         // r1 loaded from memory (ldxdw r1, [r2+0]) -> unknown, not the earlier mov
-        let prog = [mov(1, 1), insn(0x79, 1, 2, 0, 0), syscall(CURVE), exit()];
+        let prog = [mov(1, 1), instr(0x79, 1, 2, 0, 0), syscall(CURVE), exit()];
         let r = run(&prog, &[0]);
         assert_eq!(selectors_of(&r), vec![None]);
     }
@@ -415,11 +415,11 @@ mod tests {
     fn lddw_is_two_slots_and_jump_targets_count_them() {
         // slots 0-1: lddw r3, X; 2: if r2 == 0 goto 4; 3: r1 = 1; 4: r1 = 2; 5: call curve
         let mut lddw = Vec::new();
-        lddw.extend_from_slice(&insn(sbpf::OP_LDDW, 3, 0, 0, 5));
+        lddw.extend_from_slice(&instr(sbpf::OP_LDDW, 3, 0, 0, 5));
         lddw.extend_from_slice(&[0u8; 8]);
         let mut text = lddw;
         for i in [
-            insn(0x15, 2, 0, 1, 0),
+            instr(0x15, 2, 0, 1, 0),
             mov(1, 1),
             mov(1, 2),
             syscall(CURVE),
@@ -428,7 +428,7 @@ mod tests {
             text.extend_from_slice(&i);
         }
         let code = Code::decode(&text, 0, 0);
-        assert_eq!(code.insns.len(), 6);
+        assert_eq!(code.instrs.len(), 6);
         let calls = classify_calls(&code, &HashMap::new(), &hash_table());
         let r = analyze_range(&code, &calls, &BTreeSet::from([0]));
         // jump from slot 2 skips slot 3 and lands on slot 4 (r1 = 2): both paths give 2
@@ -438,14 +438,14 @@ mod tests {
     #[test]
     fn unknown_hash_and_indirect_calls_are_counted() {
         let prog = [
-            insn(
+            instr(
                 sbpf::OP_CALL,
                 0,
                 0,
                 0,
                 syscall_hash("sol_future_syscall") as i32,
             ),
-            insn(sbpf::OP_CALLX, 0, 2, 0, 0),
+            instr(sbpf::OP_CALLX, 0, 2, 0, 0),
             exit(),
         ];
         let r = run(&prog, &[0]);

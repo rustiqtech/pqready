@@ -272,14 +272,52 @@ pub fn scan_elf(
         }
     }
 
-    // Analyse each executable range.
-    for r in &ranges {
-        let code = Code::decode(
-            &bytes[r.file_start..r.file_end],
-            r.file_start,
-            r.vaddr_start,
-        );
-        let calls = classify_calls(&code, &reloc_calls, table);
+    let lddw_values = lddw_relocation_values(&elf, bytes, &ranges);
+
+    // Decode each executable range and apply relocated `lddw` values.
+    let codes: Vec<Code> = ranges
+        .iter()
+        .map(|r| {
+            let mut code = Code::decode(
+                &bytes[r.file_start..r.file_end],
+                r.file_start,
+                r.vaddr_start,
+            );
+            let base = code.file_base;
+            for i in code
+                .instrs
+                .iter_mut()
+                .filter(|i| i.opc == OP_LDDW && i.len == 2)
+            {
+                if let Some(&v) = lddw_values.get(&(base + i.slot * 8)) {
+                    i.imm64 = v;
+                }
+            }
+            code
+        })
+        .collect();
+
+    // Addresses loaded by `lddw` that may point at functions (function pointers), gathered across
+    // all ranges: a pointer loaded in one section may target another. In a relocatable object only
+    // relocated values are addresses; other immediates are plain numbers and could collide with
+    // synthetic section addresses.
+    let lddw_targets: BTreeSet<u64> = if is_rel {
+        lddw_values.values().map(|&v| v as u64).collect()
+    } else {
+        codes
+            .iter()
+            .flat_map(|c| {
+                c.instrs
+                    .iter()
+                    .filter(|i| i.opc == OP_LDDW)
+                    .map(|i| i.imm64 as u64)
+            })
+            .collect()
+    };
+
+    // Analyse each range.
+    for code in &codes {
+        let calls = classify_calls(code, &reloc_calls, table);
 
         let mut roots: BTreeSet<usize> = BTreeSet::new();
         for v in root_vaddrs.iter().chain(&taken_vaddrs) {
@@ -288,19 +326,17 @@ pub fn scan_elf(
         for f in root_files.iter().chain(&taken_files) {
             roots.extend(code.idx_at_file(*f));
         }
-        // Addresses of functions loaded as constants (function pointers).
-        if !is_rel {
-            for i in code.insns.iter().filter(|i| i.opc == OP_LDDW) {
-                roots.extend(code.idx_at_vaddr(i.imm64 as u64));
-            }
+        // Functions whose address is loaded by an `lddw` (function pointers).
+        for v in &lddw_targets {
+            roots.extend(code.idx_at_vaddr(*v));
         }
         let roots_found = !roots.is_empty();
-        if !roots_found && !code.insns.is_empty() {
+        if !roots_found && !code.instrs.is_empty() {
             roots.insert(0); // analyse from the start; reachability not reported
         }
         report.roots_found |= roots_found;
 
-        let res = analyze_range(&code, &calls, &roots);
+        let res = analyze_range(code, &calls, &roots);
         report.indirect_calls += res.indirect_calls;
         report.functions += res.functions;
         for (h, n) in res.unresolved {
@@ -459,8 +495,8 @@ fn dynamic_from_sections<'a>(bytes: &'a [u8], elf: &mut Elf<'a>) -> Result<bool>
     Ok(true)
 }
 
-/// Target of an R_BPF_64_RELATIVE relocation: an lddw immediate pair if the
-/// location is in code, otherwise a 64-bit value in data.
+/// Target of an R_BPF_64_RELATIVE relocation, read as the loader reads it: the lddw immediate pair
+/// if the location is in code, otherwise the 32-bit value at r_offset + 4 in data.
 fn relative_target(bytes: &[u8], elf: &Elf, ranges: &[Range], r_offset: u64) -> Option<u64> {
     let loc = vaddr_to_file(elf, r_offset)?;
     let read_u32 = |o: usize| {
@@ -476,9 +512,10 @@ fn relative_target(bytes: &[u8], elf: &Elf, ranges: &[Range], r_offset: u64) -> 
         let hi = read_u32(loc + 12)?;
         Some((u64::from(hi) << 32) | u64::from(lo))
     } else {
-        bytes
-            .get(loc..loc + 8)
-            .map(|b| u64::from_le_bytes(b.try_into().unwrap()))
+        // In data the loader reads only the 32-bit value at r_offset + 4 (kept for compatibility
+        // with toolchains that stored the address there) and writes back a 64-bit address: sbpf
+        // elf.rs, R_BPF_64_RELATIVE.
+        read_u32(loc + 4).map(u64::from)
     }
 }
 
@@ -581,6 +618,83 @@ fn data_regions<'a>(elf: &Elf, bytes: &'a [u8]) -> Vec<DataRegion<'a>> {
     regs
 }
 
+/// `lddw` instructions patched by an R_BPF_64_64 relocation, mapped from the file offset of the
+/// `lddw` to the value it holds once relocated. Without this, such an `lddw` would be read as its
+/// placeholder immediate.
+///
+/// The value follows the loader (sbpf crate `elf.rs`, relocation pass): symbol value plus the
+/// implicit addend in the low 32-bit immediate; the high immediate is ignored. The region base the
+/// loader adds at run time is left out, so values are ELF addresses, comparable with
+/// `section_address` and `DataRegion` addresses. Relocations against undefined or absolute symbols
+/// are skipped, so their `lddw` stays unresolved rather than guessed.
+fn lddw_relocation_values(elf: &Elf, bytes: &[u8], ranges: &[Range]) -> HashMap<usize, i64> {
+    let in_code = |off: usize| {
+        ranges
+            .iter()
+            .any(|r| off >= r.file_start && off < r.file_end)
+    };
+    let imm_low = |site: usize| {
+        bytes
+            .get(site + 4..site + 8)
+            .map(|b| u64::from(u32::from_le_bytes(b.try_into().unwrap())))
+    };
+    let mut values = HashMap::new();
+
+    // Linked programs: dynamic relocations against .dynsym.
+    for reloc in elf.dynrels.iter().chain(elf.dynrelas.iter()) {
+        if reloc.r_type != R_BPF_64_64 || reloc.r_sym == 0 {
+            continue;
+        }
+        let Some(sym) = elf.dynsyms.get(reloc.r_sym).filter(|s| s.st_shndx != 0) else {
+            continue;
+        };
+        let Some(site) = vaddr_to_file(elf, reloc.r_offset).filter(|&s| in_code(s)) else {
+            continue;
+        };
+        let Some(addend) = reloc.r_addend.map(|a| a as u64).or_else(|| imm_low(site)) else {
+            continue;
+        };
+        values.insert(site, sym.st_value.wrapping_add(addend) as i64);
+    }
+
+    // Relocatable objects: section relocations against .symtab.
+    if elf.header.e_type == header::ET_REL {
+        for (reloc_sec, relocs) in &elf.shdr_relocs {
+            let Some(target) = elf
+                .section_headers
+                .get(*reloc_sec)
+                .and_then(|rs| elf.section_headers.get(rs.sh_info as usize))
+            else {
+                continue;
+            };
+            for reloc in relocs.iter() {
+                if reloc.r_type != R_BPF_64_64 || reloc.r_sym == 0 {
+                    continue;
+                }
+                let Some(sym) = elf.syms.get(reloc.r_sym) else {
+                    continue;
+                };
+                let Some(base) = section_address(elf, sym.st_shndx) else {
+                    continue;
+                };
+                let site = target.sh_offset as usize + reloc.r_offset as usize;
+                if !in_code(site) {
+                    continue;
+                }
+                let Some(addend) = reloc.r_addend.map(|a| a as u64).or_else(|| imm_low(site))
+                else {
+                    continue;
+                };
+                values.insert(
+                    site,
+                    base.wrapping_add(sym.st_value).wrapping_add(addend) as i64,
+                );
+            }
+        }
+    }
+    values
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -613,5 +727,63 @@ mod tests {
         assert!(hit.evidence.contains(&Evidence::Relocation));
         assert_eq!(hit.count, 1);
         assert_eq!(hit.selectors, BTreeSet::from([1]));
+    }
+
+    fn values(bytes: &[u8]) -> HashMap<usize, i64> {
+        let elf = Elf::parse(bytes).unwrap();
+        lddw_relocation_values(&elf, bytes, &executable_ranges(&elf, bytes.len()))
+    }
+
+    #[test]
+    fn object_file_lddw_against_rodata_section_symbol() {
+        // tests/fixtures/memcmp_call.c, built with
+        // clang --target=bpf -O2 -fPIC -fno-builtin -c:
+        // `r2 = 0 ll` + R_BPF_64_64 .rodata at .text offset 0.
+        // .text is at file offset 0x40; .rodata is section 4 with ED25519_ID at 0.
+        let bytes = include_bytes!("../tests/fixtures/memcmp_call.o");
+        assert_eq!(values(bytes), HashMap::from([(0x40, 4i64 << 32)]));
+    }
+
+    #[test]
+    fn linked_program_lddw_uses_symbol_plus_low_immediate() {
+        // tests/gen_dyn_elf.py lddw64.so: ID.st_value = 0x2000, imm_lo = 0x10,
+        // imm_hi = 0x77 (ignored by the loader), lddw at .text start.
+        let bytes = include_bytes!("../tests/fixtures/lddw64.so");
+        let elf = Elf::parse(bytes).unwrap();
+        let text = elf.section_headers[1].sh_offset as usize;
+        assert_eq!(values(bytes), HashMap::from([(text, 0x2010)]));
+    }
+
+    #[test]
+    fn no_relocated_lddw_gives_empty_map() {
+        assert!(values(include_bytes!("../tests/fixtures/mapped.so")).is_empty());
+    }
+
+    fn curve_site(bytes: &[u8]) -> (usize, usize, BTreeSet<i64>) {
+        let r = scan_elf(bytes, &hash_table(), &[]).unwrap();
+        let h = &r.syscalls["sol_curve_group_op"];
+        (
+            h.unreachable_sites,
+            h.unknown_selector_sites,
+            h.selectors.clone(),
+        )
+    }
+
+    #[test]
+    fn object_file_function_pointer_via_lddw_is_a_root() {
+        // tests/fixtures/fnptr.c (clang --target=bpf -O2 -fPIC -c): `on_curve` is
+        // static and called only through a pointer loaded by
+        // `r3 = 0x30 ll` + R_BPF_64_64 .text.
+        let bytes = include_bytes!("../tests/fixtures/fnptr.o");
+        assert_eq!(curve_site(bytes), (0, 0, BTreeSet::from([1])));
+    }
+
+    #[test]
+    fn function_pointer_in_data_is_read_as_the_loader_reads_it() {
+        // tests/gen_dyn_elf.py reldata.so: R_BPF_64_RELATIVE in .data.rel.ro,
+        // address in the 32 bits at r_offset + 4. Reading 64 bits at r_offset
+        // instead gives address << 32 and the handler looks unreachable.
+        let bytes = include_bytes!("../tests/fixtures/reldata.so");
+        assert_eq!(curve_site(bytes), (0, 0, BTreeSet::from([1])));
     }
 }

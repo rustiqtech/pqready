@@ -47,14 +47,14 @@ pub struct Code {
     pub file_base: usize,
     /// Virtual address of slot 0.
     pub vaddr_base: u64,
-    pub insns: Vec<Instr>,
+    pub instrs: Vec<Instr>,
     by_slot: HashMap<usize, usize>,
 }
 
 impl Code {
     pub fn decode(text: &[u8], file_base: usize, vaddr_base: u64) -> Self {
         let n = text.len() / 8;
-        let mut insns = Vec::with_capacity(n);
+        let mut instrs = Vec::with_capacity(n);
         let mut by_slot = HashMap::with_capacity(n);
         let mut slot = 0;
         while slot < n {
@@ -67,8 +67,8 @@ impl Code {
             } else {
                 (1, i64::from(imm))
             };
-            by_slot.insert(slot, insns.len());
-            insns.push(Instr {
+            by_slot.insert(slot, instrs.len());
+            instrs.push(Instr {
                 slot,
                 opc,
                 dst: b[1] & 0x0f,
@@ -83,7 +83,7 @@ impl Code {
         Self {
             file_base,
             vaddr_base,
-            insns,
+            instrs,
             by_slot,
         }
     }
@@ -109,7 +109,7 @@ impl Code {
     }
 
     pub fn file_off(&self, idx: usize) -> usize {
-        self.file_base + self.insns[idx].slot * 8
+        self.file_base + self.instrs[idx].slot * 8
     }
 }
 
@@ -144,7 +144,7 @@ pub fn classify_calls(
     table: &HashMap<u32, &'static Syscall>,
 ) -> HashMap<usize, Call> {
     let mut calls = HashMap::new();
-    for (idx, i) in code.insns.iter().enumerate() {
+    for (idx, i) in code.instrs.iter().enumerate() {
         let call = match i.opc {
             OP_CALLX => Call::Indirect,
             OP_CALL => {
@@ -193,7 +193,7 @@ pub fn is_store(opc: u8) -> bool {
 /// Intra-procedural successors: calls fall through, exits have none.
 pub fn successors(code: &Code, idx: usize, out: &mut Vec<usize>) {
     out.clear();
-    let i = &code.insns[idx];
+    let i = &code.instrs[idx];
     let target = || code.idx_at_slot(i.slot as i64 + 1 + i64::from(i.off));
     let fall = || code.idx_at_slot((i.slot + i.len) as i64);
     match i.opc {
