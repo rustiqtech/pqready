@@ -170,6 +170,8 @@ mod tests {
         assert_eq!(syscall_hash("sol_secp256k1_recover"), 0x17e4_0350);
         assert_eq!(syscall_hash("sol_alt_bn128_group_op"), 0xae0c_318b);
         assert_eq!(syscall_hash("sol_curve_group_op"), 0xdd1c_41a6);
+        assert_eq!(syscall_hash("sol_curve_decompress"), 0x080c_98b0);
+        assert_eq!(syscall_hash("sol_sha512"), 0x9229_cdcc);
     }
 
     #[test]
