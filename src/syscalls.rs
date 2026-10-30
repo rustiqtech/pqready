@@ -55,6 +55,7 @@ pub const SYSCALLS: &[Syscall] = &[
     s("sol_curve_validate_point", QuantumVulnerable, "curve id"),
     s("sol_curve_group_op", QuantumVulnerable, "curve id"),
     s("sol_curve_multiscalar_mul", QuantumVulnerable, "curve id"),
+    s("sol_curve_decompress", QuantumVulnerable, "curve id"),
     s("sol_curve_pairing_map", QuantumVulnerable, "curve id"),
     s(
         "sol_alt_bn128_group_op",
@@ -75,6 +76,7 @@ pub const SYSCALLS: &[Syscall] = &[
     s("sol_create_program_address", Benign, ""),
     s("sol_try_find_program_address", Benign, ""),
     s("sol_sha256", Benign, ""),
+    s("sol_sha512", Benign, ""),
     s("sol_keccak256", Benign, ""),
     s("sol_blake3", Benign, ""),
     s("sol_get_clock_sysvar", Benign, ""),
