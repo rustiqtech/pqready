@@ -7,6 +7,8 @@
 mod constprop;
 mod elf;
 mod fetch;
+mod keys;
+mod pqtables;
 mod precompile;
 mod sbpf;
 mod syscalls;

@@ -116,6 +116,10 @@ pub struct RawSnapshots {
     pub xors: BTreeMap<usize, [Val; 2]>,
     /// Every store: address (base + offset), stored value, size in bytes.
     pub stores: BTreeMap<usize, (Val, Val, u8)>,
+    /// Value of every `lddw`: relocations already applied by the caller.
+    pub lddws: BTreeMap<usize, i64>,
+    /// Address of every load from memory: base + offset.
+    pub mem_loads: BTreeMap<usize, Val>,
 }
 
 /// Values recorded within one reachable function, parameters resolved: a set
@@ -126,6 +130,14 @@ pub struct FnSnapshots {
     pub jumps: BTreeMap<usize, [Option<Set>; 2]>,
     pub xors: BTreeMap<usize, [Option<Set>; 2]>,
     pub stores: BTreeMap<usize, Store>,
+    /// Value of every `lddw` in the function.
+    pub lddws: BTreeMap<usize, i64>,
+    /// Address of every load from memory: base + offset.
+    pub mem_loads: BTreeMap<usize, Option<Set>>,
+    /// r1..r3 at every call before parameters are resolved, so that `Val::Entry(i)` ("this
+    /// function's own i-th argument") stays visible.  Argument-forwarding wrappers are recognised
+    /// from these.
+    pub raw_calls: BTreeMap<usize, [Val; 3]>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -138,9 +150,21 @@ pub struct Store {
 const OP_XOR64_IMM: u8 = 0xa7;
 const OP_XOR64_REG: u8 = 0xaf;
 
-/// Size in bytes of a plain store (BPF_MEM mode), or None for any other opcode.
-/// ST (immediate value): 0x62 w, 0x6a h, 0x72 b, 0x7a dw; STX (register value):
-/// 0x63, 0x6b, 0x73, 0x7b. Atomic and other modes are not stores here.
+/// Size in bytes of a plain load from memory (LDX, BPF_MEM mode), or None.  0x61 w, 0x69 h, 0x71 b,
+/// 0x79 dw.
+fn load_size(opc: u8) -> Option<u8> {
+    match opc {
+        0x61 => Some(4),
+        0x69 => Some(2),
+        0x71 => Some(1),
+        0x79 => Some(8),
+        _ => None,
+    }
+}
+
+/// Size in bytes of a plain store (BPF_MEM mode), or None for any other opcode.  ST (immediate
+/// value): 0x62 w, 0x6a h, 0x72 b, 0x7a dw; STX (register value): 0x63, 0x6b, 0x73, 0x7b. Atomic
+/// and other modes are not stores here.
 fn store_size(opc: u8) -> Option<u8> {
     match opc {
         0x62 | 0x63 => Some(4),
@@ -164,6 +188,8 @@ fn record(code: &Code, calls: &HashMap<usize, Call>, idx: usize, s: &Regs, raw: 
     };
     if calls.contains_key(&idx) {
         raw.calls.insert(idx, [reg(1), reg(2), reg(3)]);
+    } else if i.opc == sbpf::OP_LDDW && i.len == 2 {
+        raw.lddws.insert(idx, i.imm64);
     } else if sbpf::is_cond_jump(i.opc) {
         raw.jumps.insert(idx, [reg(i.dst), src_operand()]);
     } else if !code.model_alu {
@@ -173,6 +199,11 @@ fn record(code: &Code, calls: &HashMap<usize, Call>, idx: usize, s: &Regs, raw: 
     } else if let Some(size) = store_size(i.opc) {
         let addr = map_consts(&reg(i.dst), |b| b.wrapping_add(i64::from(i.off)));
         raw.stores.insert(idx, (addr, src_operand(), size));
+    } else if load_size(i.opc).is_some() {
+        raw.mem_loads.insert(
+            idx,
+            map_consts(&reg(i.src), |b| b.wrapping_add(i64::from(i.off))),
+        );
     }
 }
 
@@ -369,6 +400,9 @@ pub fn analyze_range(
                     )
                 })
                 .collect(),
+            lddws: raw.lddws.clone(),
+            mem_loads: raw.mem_loads.iter().map(|(&k, a)| (k, res(a, e))).collect(),
+            raw_calls: raw.calls.clone(),
         };
         out.snapshots.insert(*f, snap);
     }
@@ -818,5 +852,73 @@ mod tests {
         let (_, r) = snaps(&prog, &[0], true);
         assert_eq!(r.snapshots.keys().copied().collect::<Vec<_>>(), vec![0]);
         assert!(r.snapshots[&0].calls.is_empty());
+    }
+
+    // --- lddw values, load addresses, unresolved call arguments ---
+
+    #[test]
+    fn lddw_values_and_load_addresses() {
+        let [a, b] = lddw(1, X);
+        // 0-1: lddw r1, X; 2: r1 += 0x20; 3: r2 = *(u64 *)(r1 + 8); 4: exit
+        let prog = [
+            a,
+            b,
+            instr(sbpf::OP_ADD64_IMM, 1, 0, 0, 0x20),
+            instr(0x79, 2, 1, 8, 0),
+            exit(),
+        ];
+        let (code, r) = snaps(&prog, &[0], true);
+        let s = &r.snapshots[&0];
+        assert_eq!(s.lddws, BTreeMap::from([(at_slot(&code, 0), X)]));
+        assert_eq!(s.mem_loads[&at_slot(&code, 3)], set(&[X + 0x28]));
+    }
+
+    #[test]
+    fn raw_call_arguments_keep_entry_values() {
+        // W (slot 4) forwards its own r1..r3 to sol_memcmp_ after saving r2 in r8
+        // and putting it back, as the toolchain's memcmp does.
+        // root: lddw r2, X; r3 = 32; call W; exit
+        let [a, b] = lddw(2, X);
+        let prog = [
+            a,
+            b,                                     // slots 0-1
+            mov(3, 32),                            // 2
+            call_to(3, 5),                         // 3
+            exit(),                                // 4
+            instr(sbpf::OP_MOV64_REG, 8, 2, 0, 0), // 5: r8 = r2
+            mov(2, 0),                             // 6: r2 clobbered
+            instr(sbpf::OP_MOV64_REG, 2, 8, 0, 0), // 7: r2 = r8
+            syscall(MEMCMP),                       // 8
+            exit(),                                // 9
+        ];
+        let (code, r) = snaps(&prog, &[0], true);
+        let w = &r.snapshots[&at_slot(&code, 5)];
+        assert_eq!(
+            w.raw_calls[&at_slot(&code, 8)],
+            [Val::Entry(1), Val::Entry(2), Val::Entry(3)]
+        );
+        // Resolved through the caller, r2 and r3 are the constants it passed.
+        assert_eq!(w.calls[&at_slot(&code, 8)][1..], [set(&[X]), set(&[32])]);
+        // The caller's own call to W carries the values the rules read.
+        let root = &r.snapshots[&0];
+        assert_eq!(root.calls[&at_slot(&code, 3)][1..], [set(&[X]), set(&[32])]);
+    }
+
+    #[test]
+    fn rearranged_argument_is_not_an_entry_value() {
+        // W changes r2 before the syscall: r2 = r2 + 8. No longer Entry(2).
+        let prog = [
+            call_to(0, 2),                         // 0: call W
+            exit(),                                // 1
+            instr(sbpf::OP_ADD64_IMM, 2, 0, 0, 8), // 2: r2 += 8
+            syscall(MEMCMP),                       // 3
+            exit(),                                // 4
+        ];
+        let (code, r) = snaps(&prog, &[0], true);
+        let w = &r.snapshots[&at_slot(&code, 2)];
+        assert_eq!(
+            w.raw_calls[&at_slot(&code, 3)],
+            [Val::Entry(1), Val::Unknown, Val::Entry(3)]
+        );
     }
 }

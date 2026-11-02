@@ -25,6 +25,7 @@
 //! dead code.
 
 use crate::constprop::analyze_range;
+use crate::pqtables;
 use crate::precompile::{self, DataRegion, LocatedId, RefBytes};
 use crate::sbpf::{Code, OP_LDDW, RelocCall, classify_calls, models_alu};
 use crate::syscalls::{Syscall, by_name};
@@ -89,6 +90,12 @@ pub struct ElfReport {
     /// inside `scan_elf`.
     #[cfg(test)]
     pub snapshots: Vec<std::collections::BTreeMap<usize, crate::constprop::FnSnapshots>>,
+    /// PQ constant tables found in loaded data (see `pqtables`).
+    pub pq_tables: Vec<pqtables::TableHit>,
+    /// Distinct Keccak round constants among reachable `lddw` values.
+    pub keccak_constants_inline: usize,
+    /// Weak signals: moduli among immediates, by name, with counts.
+    pub pq_weak: BTreeMap<&'static str, usize>,
 }
 
 struct Range {
@@ -320,6 +327,8 @@ pub fn scan_elf(
             .collect()
     };
 
+    let mut reachable_lddws: Vec<i64> = Vec::new();
+
     // Analyse each range.
     for code in &codes {
         let calls = classify_calls(code, &reloc_calls, table);
@@ -345,6 +354,11 @@ pub fn scan_elf(
         #[cfg(test)]
         report.snapshots.push(res.snapshots.clone());
 
+        reachable_lddws.extend(
+            res.snapshots
+                .values()
+                .flat_map(|f| f.lddws.values().copied()),
+        );
         report.indirect_calls += res.indirect_calls;
         report.functions += res.functions;
         for (h, n) in res.unresolved {
@@ -370,7 +384,89 @@ pub fn scan_elf(
             }
         }
     }
+
+    // PQ constant tables in loaded data, and weak signals in code.
+    let regions = data_regions(&elf, bytes);
+    report.pq_tables = pqtables::find_tables(&regions, &&pqtables::table_forms(), &reachable_lddws);
+    report.keccak_constants_inline = pqtables::keccak_constants_inline(&reachable_lddws);
+    report.pq_weak = pqtables::weak_signals(
+        codes.iter().flat_map(|c| c.instrs.iter().map(|i| i.imm)),
+        &reachable_lddws,
+    );
+
     Ok(report)
+}
+
+/// What `pqready inspect` shows: the 32-byte entries around an address in
+/// loaded data, and every `lddw` whose value (after relocation) points into that
+/// range, by instruction address.
+pub struct Inspection {
+    /// (address, the 32 bytes there if they lie wholly in one data region)
+    pub entries: Vec<(u64, Option<[u8; 32]>)>,
+    /// (instruction address, value)
+    pub loads: Vec<(u64, i64)>,
+}
+
+/// Base of the program region in SBPF V3, where code may refer to read-only data
+/// by its run-time address.
+const V3_BASE: u64 = 1 << 32;
+
+pub fn inspect(bytes: &[u8], address: u64, before: u64, after: u64) -> Result<Inspection> {
+    // Same parse as `scan_elf`, without the analysis.
+    let patched;
+    let elf = match Elf::parse(bytes) {
+        Ok(e) => e,
+        Err(first) => {
+            patched = without_dynamic_segment(bytes)
+                .ok_or(first)
+                .context("ELF parse")?;
+            Elf::parse(&patched).context("ELF parse (dynamic segment hidden)")?
+        }
+    };
+    let regions = data_regions(&elf, bytes);
+    let lo = address.saturating_sub(32 * before);
+    let hi = address + 32 * (after + 1);
+    let entries = (lo..hi)
+        .step_by(32)
+        .map(|a| {
+            let e = regions.iter().find_map(|&DataRegion { bytes, address }| {
+                let off = usize::try_from(a.checked_sub(address)?).ok()?;
+                bytes
+                    .get(off..off + 32)
+                    .map(|s| <[u8; 32]>::try_from(s).unwrap())
+            });
+            (a, e)
+        })
+        .collect();
+
+    let ranges = executable_ranges(&elf, bytes.len());
+    let lddw_values = lddw_relocation_values(&elf, bytes, &ranges);
+    let mut loads = Vec::new();
+    for r in &ranges {
+        let code = Code::decode(
+            &bytes[r.file_start..r.file_end],
+            r.file_start,
+            r.vaddr_start,
+        );
+        for i in code
+            .instrs
+            .iter()
+            .filter(|i| i.opc == OP_LDDW && i.len == 2)
+        {
+            let v = lddw_values
+                .get(&(code.file_base + i.slot * 8))
+                .copied()
+                .unwrap_or(i.imm64);
+            let t = v as u64;
+            if (lo..hi).contains(&t)
+                || t.checked_sub(V3_BASE)
+                    .is_some_and(|t| (lo..hi).contains(&t))
+            {
+                loads.push((code.vaddr_base + 8 * i.slot as u64, v));
+            }
+        }
+    }
+    Ok(Inspection { entries, loads })
 }
 
 const DYN_TABLE_TAGS: [u64; 4] = [
@@ -594,6 +690,8 @@ fn section_address(elf: &Elf, index: usize) -> Option<u64> {
     }
 }
 
+/// Loaded, non-code data: allocated sections that are not executable and have file contents, or,
+/// without section headers, non-executable PT_LOAD segments.
 fn data_regions<'a>(elf: &Elf, bytes: &'a [u8]) -> Vec<DataRegion<'a>> {
     let make = |off: u64, size: u64, vaddr: u64| make_range(bytes.len(), off, size, vaddr);
     let reg = |r: Range| DataRegion {
@@ -847,6 +945,190 @@ mod tests {
             one_function_has_all,
             "chunks {chunks:x?}\n{:#?}",
             r.snapshots
+        );
+    }
+
+    /// (scheme, form, windows matched, code refs) for each table found.
+    fn tables(bytes: &[u8]) -> Vec<(&'static str, String, usize, usize)> {
+        let r = scan_elf(bytes, &hash_table(), &[]).unwrap();
+        r.pq_tables
+            .iter()
+            .map(|t| (t.scheme, t.form.clone(), t.windows_matched, t.code_refs))
+            .collect()
+    }
+
+    fn one(
+        scheme: &'static str,
+        form: &str,
+        refs: usize,
+    ) -> Vec<(&'static str, String, usize, usize)> {
+        vec![(scheme, form.to_string(), 3, refs)]
+    }
+
+    // tests/fixtures/pq/*.o: tables from maintained implementations, extracted
+    // into pq/*.c and compiled with clang --target=bpf -O2 -fPIC -ffreestanding.
+    #[test]
+    fn tables_from_maintained_implementations() {
+        assert_eq!(
+            tables(include_bytes!("../tests/fixtures/pq/mldsa_native_zetas.o")),
+            one("ml-dsa", "bitrev,mont32,centred,4B", 1)
+        );
+        assert_eq!(
+            tables(include_bytes!("../tests/fixtures/pq/mlkem_native_zetas.o")),
+            one("ml-kem", "bitrev,mont16,centred,2B", 1)
+        );
+        assert_eq!(
+            tables(include_bytes!("../tests/fixtures/pq/fndsa_gm.o")),
+            one("falcon", "bitrev,mont32,unsigned,2B", 1)
+        );
+        assert_eq!(
+            tables(include_bytes!("../tests/fixtures/pq/falcon_gmb.o")),
+            one("falcon", "bitrev,mont16,unsigned,2B", 1)
+        );
+        assert_eq!(
+            tables(include_bytes!("../tests/fixtures/pq/keccak_rc.o")),
+            one("keccak-f1600", "round constants,8B", 1)
+        );
+    }
+
+    // tests/fixtures/pq/*.so: synthetic programs with other storage forms.
+    #[test]
+    fn other_storage_forms_and_reachability() {
+        assert_eq!(
+            tables(include_bytes!(
+                "../tests/fixtures/pq/mldsa_plain_natural_u32.so"
+            )),
+            one("ml-dsa", "natural,plain,unsigned,4B", 1)
+        );
+        assert_eq!(
+            tables(include_bytes!(
+                "../tests/fixtures/pq/mlkem_gamma_plain_u16.so"
+            )),
+            one("ml-kem", "gamma,plain,unsigned,2B", 1)
+        );
+        // Present but never loaded by code.
+        assert_eq!(
+            tables(include_bytes!("../tests/fixtures/pq/mlkem_mont_u64.so")),
+            one("ml-kem", "bitrev,mont16,unsigned,8B", 0)
+        );
+    }
+
+    #[test]
+    fn no_tables_where_there_are_none() {
+        for bytes in [
+            &include_bytes!("../tests/fixtures/pq/decoy_small_ints.so")[..],
+            include_bytes!("../tests/fixtures/mapped.so"),
+            include_bytes!("../tests/fixtures/memcmp_call.o"),
+            include_bytes!("../tests/fixtures/memcmp_inline.o"),
+            include_bytes!("../tests/fixtures/fnptr.o"),
+            include_bytes!("../tests/fixtures/reldata.so"),
+        ] {
+            assert!(tables(bytes).is_empty());
+        }
+    }
+}
+
+#[cfg(test)]
+mod rule_fixture_tests {
+    //! Facts the precompile rules rely on, checked on tests/fixtures/rules/*.so
+    //! (generated by tests/gen_rule_fixtures.py; expected rule outcomes are
+    //! listed there). These programs map file offsets to identical addresses.
+    use super::*;
+    use crate::constprop::{FnSnapshots, Val};
+    use crate::syscalls::hash_table;
+    use memchr::memmem;
+
+    const ED25519: &str = "Ed25519SigVerify111111111111111111111111111";
+    const SYSVAR: &str = "Sysvar1nstructions1111111111111111111111111";
+
+    fn addr_of(bytes: &[u8], id: &str) -> i64 {
+        let id = bs58::decode(id).into_vec().unwrap();
+        memmem::find(bytes, &id).unwrap() as i64
+    }
+    fn fns(bytes: &[u8]) -> Vec<FnSnapshots> {
+        let r = scan_elf(bytes, &hash_table(), &[]).unwrap();
+        r.snapshots
+            .into_iter()
+            .flat_map(|m| m.into_values())
+            .collect()
+    }
+    /// Some reachable call has r2 = {addr} and r3 = {32}.
+    fn passes(fs: &[FnSnapshots], addr: i64) -> bool {
+        fs.iter()
+            .flat_map(|f| f.calls.values())
+            .any(|c| c[1] == Some(BTreeSet::from([addr])) && c[2] == Some(BTreeSet::from([32])))
+    }
+    /// Some function calls a syscall with its own r1, r2, r3 unchanged.
+    fn forwards(fs: &[FnSnapshots]) -> bool {
+        fs.iter()
+            .flat_map(|f| f.raw_calls.values())
+            .any(|c| *c == [Val::Entry(1), Val::Entry(2), Val::Entry(3)])
+    }
+
+    #[test]
+    fn compare_via_wrapper() {
+        let b = include_bytes!("../tests/fixtures/rules/rule_compare_via_wrapper.so");
+        let fs = fns(b);
+        assert!(
+            passes(&fs, addr_of(b, ED25519)),
+            "caller passes &ED25519 and 32 to the wrapper"
+        );
+        assert!(forwards(&fs), "wrapper forwards r1..r3 to sol_memcmp_");
+        assert!(!passes(&fs, addr_of(b, SYSVAR)));
+    }
+
+    #[test]
+    fn compare_with_sysvar() {
+        let b = include_bytes!("../tests/fixtures/rules/rule_compare_with_sysvar.so");
+        let fs = fns(b);
+        assert!(passes(&fs, addr_of(b, ED25519)));
+        assert!(passes(&fs, addr_of(b, SYSVAR)));
+        assert!(forwards(&fs));
+    }
+
+    #[test]
+    fn wrapper_rearranged_does_not_forward() {
+        let b = include_bytes!("../tests/fixtures/rules/rule_wrapper_rearranged.so");
+        let fs = fns(b);
+        assert!(
+            passes(&fs, addr_of(b, ED25519)),
+            "the call to the wrapper still carries the ID"
+        );
+        assert!(!forwards(&fs), "r2 is changed before sol_memcmp_");
+    }
+
+    #[test]
+    fn id_passed_to_a_non_comparing_function() {
+        let b = include_bytes!("../tests/fixtures/rules/rule_id_passed.so");
+        let fs = fns(b);
+        assert!(passes(&fs, addr_of(b, ED25519)));
+        assert!(!forwards(&fs), "the callee only logs");
+    }
+
+    #[test]
+    fn unreferenced_id() {
+        let b = include_bytes!("../tests/fixtures/rules/rule_unreferenced.so");
+        let a = addr_of(b, ED25519);
+        let fs = fns(b);
+        let touched = fs.iter().any(|f| {
+            f.lddws.values().any(|&v| (a..a + 32).contains(&v))
+                || f.calls
+                    .values()
+                    .flatten()
+                    .flatten()
+                    .flatten()
+                    .any(|&v| (a..a + 32).contains(&v))
+        });
+        assert!(!touched);
+    }
+
+    #[test]
+    fn compare_by_direct_syscall() {
+        let b = include_bytes!("../tests/fixtures/rules/rule_compare_direct_syscall.so");
+        let fs = fns(b);
+        assert!(
+            passes(&fs, addr_of(b, ED25519)),
+            "sol_memcmp_ itself receives &ED25519 and 32"
         );
     }
 }
