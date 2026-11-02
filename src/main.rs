@@ -55,6 +55,19 @@ enum Cmd {
     },
     /// Scan a single ELF and print what was found (for validation).
     ScanOne { path: PathBuf },
+    /// Show the 32-byte entries around an address in a program's data, labelled where they are
+    /// built-in programs or sysvars, and the instructions that load addresses in that range. For
+    /// reviewing precompile and key-list rows.
+    Inspect {
+        path: PathBuf,
+        /// Address as printed by scan-one, e.g. 0x15e0.
+        #[arg(value_parser = parse_address)]
+        address: u64,
+        #[arg(long, default_value_t = 12)]
+        before: u64,
+        #[arg(long, default_value_t = 12)]
+        after: u64,
+    },
 }
 
 #[derive(Serialize)]
@@ -105,7 +118,56 @@ fn main() -> Result<()> {
         }),
         Cmd::Scan { raw, out } => scan_all(&raw, &out),
         Cmd::ScanOne { path } => scan_one(&path),
+        Cmd::Inspect {
+            path,
+            address,
+            before,
+            after,
+        } => inspect(&path, address, before, after),
     }
+}
+
+fn parse_address(s: &str) -> Result<u64, String> {
+    let t = s.trim();
+    match t.strip_prefix("0x").or_else(|| t.strip_prefix("0X")) {
+        Some(h) => u64::from_str_radix(h, 16),
+        None => t.parse(),
+    }
+    .map_err(|e| format!("{s:?}: {e}"))
+}
+
+fn inspect(path: &Path, address: u64, before: u64, after: u64) -> Result<()> {
+    let bytes = fs::read(path).with_context(|| path.display().to_string())?;
+    let r = elf::inspect(&bytes, address, before, after)?;
+    let labels = keys::all();
+    println!("entries (32 bytes each; * = {address:#x}):");
+    for (a, e) in &r.entries {
+        let mark = if *a == address { '*' } else { ' ' };
+        match e {
+            Some(b) => {
+                let label = labels.get(b).copied().unwrap_or("");
+                println!(
+                    "{mark} {a:#10x}  {:<44}  {label}",
+                    bs58::encode(b).into_string()
+                );
+            }
+            None => println!("{mark} {a:#10x}  (not in loaded data)"),
+        }
+    }
+    println!("\nlddw instructions loading an address in this range:");
+    if r.loads.is_empty() {
+        println!("  none");
+    }
+    for (insn, v) in &r.loads {
+        // V3 code may use the run-time address (base 2^32) of the same data.
+        let t = (*v as u64)
+            .checked_sub(1 << 32)
+            .filter(|t| *t < (1 << 32))
+            .unwrap_or(*v as u64);
+        let rel = (t as i64 - address as i64).div_euclid(32);
+        println!("  at {insn:#x}: {v:#x}  (entry {rel:+} from {address:#x})");
+    }
+    Ok(())
 }
 
 fn class_of(name: &str) -> &'static str {
@@ -140,6 +202,21 @@ fn scan_one(path: &Path) -> Result<()> {
     }
     for (h, n) in &r.unresolved_static_hashes {
         println!("unresolved static call hash {h:#010x} x{n}");
+    }
+    for t in &r.pq_tables {
+        println!(
+            "pq table {:<13} form={:<28} at {:#x} windows={}/{} code_refs={}",
+            t.scheme, t.form, t.address, t.windows_matched, t.windows_tried, t.code_refs
+        );
+    }
+    if r.keccak_constants_inline > 0 {
+        println!(
+            "pq keccak round constants as lddw: {}/24 distinct",
+            r.keccak_constants_inline
+        );
+    }
+    for (name, n) in &r.pq_weak {
+        println!("pq weak signal {name}: {n} immediates");
     }
     for id in r.located_ids.iter().filter(|id| id.in_file) {
         let addrs: Vec<String> = id.addresses.iter().map(|a| format!("{a:#x}")).collect();
@@ -207,8 +284,51 @@ fn elf_path(raw: &Path, p: &fetch::ProgramRow) -> PathBuf {
     raw.join("elf").join(format!("{}.so", p.program_id))
 }
 
-/// Scan one program's ELF. Never fails: read and parse errors are recorded in
-/// the summary row so one bad file does not stop the run.
+/// Rows for PQ implementations found by their constant tables (`pqtables`). Lattice tables (ML-DSA,
+/// ML-KEM, Falcon) are `pq_implementation`. Keccak round constants only support such a hit, hence
+/// `marker`. Moduli among immediates are `weak`. `count` is the number of reachable code references
+/// (tables) or occurrences (immediates).
+fn pq_rows<'a>(
+    r: &elf::ElfReport,
+    dep: &dyn Fn(&'static str, &str, &'static str, String) -> DepRow,
+) -> Vec<DepRow> {
+    let mut rows = Vec::new();
+    for t in &r.pq_tables {
+        let class = if t.scheme == "keccak-f1600" {
+            "marker"
+        } else {
+            "pq_implementation"
+        };
+        let evidence = format!(
+            "table {} at {:#x}, windows {}/{}",
+            t.form, t.address, t.windows_matched, t.windows_tried
+        );
+        rows.push(DepRow {
+            count: t.code_refs,
+            ..dep("pq_table", t.scheme, class, evidence)
+        });
+    }
+    if r.keccak_constants_inline > 0 {
+        let evidence = format!(
+            "round constants as lddw, {}/24 distinct",
+            r.keccak_constants_inline
+        );
+        rows.push(DepRow {
+            count: r.keccak_constants_inline,
+            ..dep("pq_table", "keccak-f1600", "marker", evidence)
+        });
+    }
+    for (name, n) in &r.pq_weak {
+        rows.push(DepRow {
+            count: *n,
+            ..dep("pq_table", name, "weak", "immediates".into())
+        });
+    }
+    rows
+}
+
+/// Scan one program's ELF. Never fails: read and parse errors are recorded in the summary row so
+/// one bad file does not stop the run.
 fn scan_program(
     p: &fetch::ProgramRow,
     raw: &Path,
@@ -254,22 +374,6 @@ fn scan_program(
         }
     };
 
-    // // Precompile references are byte matches, so they work even if ELF parsing fails.
-    // for (rf, n) in precompile::find_refs(&bytes, rbs) {
-    //     if rf.vulnerable {
-    //         s.vulnerable_precompile_refs += 1;
-    //     }
-    //     let class = if rf.vulnerable {
-    //         "quantum_vulnerable"
-    //     } else {
-    //         "marker"
-    //     };
-    //     deps.push(DepRow {
-    //         count: n,
-    //         ..dep("precompile_ref", rf.name, class, "rodata_bytes".into())
-    //     });
-    // }
-
     match elf::scan_elf(&bytes, table, rbs) {
         Ok(r) => {
             s.parse_ok = true;
@@ -310,6 +414,7 @@ fn scan_program(
                 });
             }
             s.unknown_imports = unknown.join(";");
+            deps.extend(pq_rows(&r, &dep));
 
             // where each ID's bytes occur, presence only
             for id in r.located_ids.iter().filter(|id| id.in_file) {
