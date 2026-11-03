@@ -9,10 +9,17 @@
 //! - crypto roles: what each dependency row is used for, from the syscall and
 //!   its selectors (curve id, BN254 operation), precompile references and PQ
 //!   tables;
-//! - control: the upgrade authority, how many programs it controls and how
-//!   many of those are flagged;
+//! - control: the upgrade authority, whether it is a plain Ed25519 key or a
+//!   program-derived address, how many programs it controls and how many of
+//!   those are flagged;
 //! - joins: optional labels (by program id, then by authority), reviews and
 //!   activity CSVs, whose columns are copied with a prefix.
+//!
+//! It also writes `authorities.csv`: every upgrade authority over all
+//! programs, not only flagged ones, with its kind and program counts. Every
+//! program under a `key` authority can be replaced by whoever holds (or
+//! recovers) that one Ed25519 private key. A `pda` authority (multisig,
+//! governance) still resolves to its members' keys, which this does not see.
 //!
 //! Input CSVs are read by header name, so extra columns are ignored.
 
@@ -362,6 +369,11 @@ pub fn run(o: &ProfileOpts) -> Result<()> {
         c.1 += flagged_set.contains(p.program_id.as_str()) as usize;
     }
 
+    let kinds: HashMap<&str, &'static str> = controls
+        .keys()
+        .map(|a| (*a, address::signer_kind(a)))
+        .collect();
+
     let mut ids: HashMap<String, Identity> = flagged
         .par_iter()
         .map(|p| {
@@ -410,6 +422,7 @@ pub fn run(o: &ProfileOpts) -> Result<()> {
         "loader",
         "upgradeable",
         "upgrade_authority",
+        "upgrade_authority_kind",
         "authority_programs",
         "authority_flagged_programs",
         "label_matched_by",
@@ -494,6 +507,11 @@ pub fn run(o: &ProfileOpts) -> Result<()> {
             prog.map(|p| p.loader.clone()).unwrap_or_default(),
             prog.map(|p| p.upgradeable.to_string()).unwrap_or_default(),
             authority.clone(),
+            kinds
+                .get(authority.as_str())
+                .copied()
+                .unwrap_or_default()
+                .into(),
             if authority.is_empty() {
                 String::new()
             } else {
@@ -537,6 +555,55 @@ pub fn run(o: &ProfileOpts) -> Result<()> {
         w.write_record(&r)?;
     }
     w.flush()?;
+    eprintln!("wrote {}", path.display());
+
+    write_authorities(&o.out, &controls, &kinds, &label_cols, &labels)
+}
+
+/// authorities.csv, most programs first, and a summary on stderr.
+fn write_authorities(
+    out: &Path,
+    controls: &HashMap<&str, (usize, usize)>,
+    kinds: &HashMap<&str, &'static str>,
+    label_cols: &[String],
+    labels: &HashMap<String, Vec<(String, String)>>,
+) -> Result<()> {
+    let mut list: Vec<(&str, usize, usize)> =
+        controls.iter().map(|(a, (n, f))| (*a, *n, *f)).collect();
+    list.sort_by(|x, y| (y.1, y.2, x.0).cmp(&(x.1, x.2, y.0)));
+    let path = out.join("authorities.csv");
+    let mut w = csv::Writer::from_path(&path)?;
+    let mut header = vec!["upgrade_authority", "kind", "programs", "flagged_programs"];
+    header.extend(label_cols.iter().map(|s| s.as_str()));
+    w.write_record(&header)?;
+    let mut totals: BTreeMap<&str, (usize, usize, usize)> = BTreeMap::new();
+    for (a, n, f) in list {
+        let kind = kinds[a];
+        let t = totals.entry(kind).or_default();
+        (t.0, t.1, t.2) = (t.0 + 1, t.1 + n, t.2 + f);
+        let mut row = vec![
+            a.to_string(),
+            kind.to_string(),
+            n.to_string(),
+            f.to_string(),
+        ];
+        for c in label_cols {
+            row.push(
+                labels
+                    .get(a)
+                    .and_then(|v| v.iter().find(|(k, _)| k == c))
+                    .map(|(_, v)| v.clone())
+                    .unwrap_or_default(),
+            );
+        }
+        w.write_record(&row)?;
+    }
+    w.flush()?;
+    for (kind, (a, n, f)) in &totals {
+        eprintln!(
+            "upgrade authorities of kind {kind}: {a}, controlling {n} programs ({f} flagged)"
+        );
+    }
     eprintln!("wrote {}", path.display());
     Ok(())
 }
@@ -595,6 +662,10 @@ mod tests {
         );
     }
 
+    /// Ed25519 base point (on the curve) and a PDA from address.rs's vectors.
+    const KEY: &str = "6x5SYnLroiN7WYq8NQYU9KHcH4YjpBbwpUfVu3EB7ieH";
+    const PDA: &str = "GPJkEFWhjnpQADAtoiSQ2upCDSPp7qCNeYtiy8ty2KcF";
+
     #[test]
     fn profile_end_to_end() {
         let d = std::env::temp_dir().join(format!("pqready-profile-{}", std::process::id()));
@@ -606,7 +677,10 @@ mod tests {
             "program_id,loader,programdata,deploy_slot,upgradeable,upgrade_authority,status,elf_len,elf_sha256,fetched_slot\n\
              P1,upgradeable,D1,1,true,AUTH,deployed,10,x,5\n\
              P2,upgradeable,D2,1,true,AUTH,deployed,10,x,5\n\
-             P3,upgradeable,D3,1,true,AUTH,deployed,10,x,5\n",
+             P3,upgradeable,D3,1,true,AUTH,deployed,10,x,5\n\
+             P4,upgradeable,D4,1,true,PDA,deployed,10,x,5\n"
+                .replace("AUTH", KEY)
+                .replace("PDA", PDA),
         )
         .unwrap();
         let mut elf = b"junk".to_vec();
@@ -620,7 +694,11 @@ mod tests {
              P3,upgradeable,true,precompile_ref,instructions_sysvar,marker,rodata_bytes,1,,0,0,\n",
         )
         .unwrap();
-        fs::write(d.join("labels.csv"), "authority,label\nAUTH,Example Labs\n").unwrap();
+        fs::write(
+            d.join("labels.csv"),
+            format!("authority,label\n{KEY},Example Labs\n"),
+        )
+        .unwrap();
         fs::write(d.join("reviews.csv"), "program_id,verdict\nP2,confirmed\n").unwrap();
         run(&ProfileOpts {
             raw,
@@ -634,6 +712,7 @@ mod tests {
         })
         .unwrap();
         let rows = read_csv(&out.join("profile.csv")).unwrap();
+        let auths = read_csv(&out.join("authorities.csv")).unwrap();
         fs::remove_dir_all(&d).unwrap();
         assert_eq!(rows.len(), 2, "P3 has only a marker row");
         let (p1, p2) = (&rows[0], &rows[1]);
@@ -658,6 +737,22 @@ mod tests {
             ("Example Labs", "authority")
         );
         assert_eq!(p2["crypto_roles"], "BN254 G1 arithmetic;BN254 pairing");
+        assert_eq!(p1["upgrade_authority_kind"], "key");
+        let summary: Vec<_> = auths
+            .iter()
+            .map(|a| {
+                (
+                    a["kind"].as_str(),
+                    a["programs"].as_str(),
+                    a["flagged_programs"].as_str(),
+                    a["label"].as_str(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            summary,
+            [("key", "3", "2", "Example Labs"), ("pda", "1", "0", "")]
+        );
         assert_eq!(
             (p1["review_verdict"].as_str(), p2["review_verdict"].as_str()),
             ("", "confirmed")

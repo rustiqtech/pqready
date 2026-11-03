@@ -14,8 +14,20 @@ const MAX_SEEDS: usize = 16;
 
 /// Whether 32 bytes decode to a point on the Ed25519 curve. A program-derived
 /// address must not, so that no private key can exist for it.
-fn is_on_curve(a: &Address) -> bool {
+pub fn is_on_curve(a: &Address) -> bool {
     CompressedEdwardsY(*a).decompress().is_some()
+}
+
+/// What kind of address signs for `a`: "key" when it is on the curve (an
+/// Ed25519 public key, so a private key may exist), "pda" when it is off the
+/// curve (a program-derived address: only its program can sign, and no private
+/// key exists), "invalid" when it is not a 32-byte base58 address.
+pub fn signer_kind(a: &str) -> &'static str {
+    match from_base58(a) {
+        Some(a) if is_on_curve(&a) => "key",
+        Some(_) => "pda",
+        None => "invalid",
+    }
 }
 
 /// sha256(seeds || program_id || "ProgramDerivedAddress"), or None if a seed is
@@ -102,6 +114,20 @@ mod tests {
             Some("13yWmRpaTR4r5nAktwLqMpRNr28tnVUZw26rTvPSSB19")
         );
         assert_eq!(create_program_address(&[&[0u8; 33]], &program), None);
+    }
+
+    #[test]
+    fn signer_kind_separates_keys_from_pdas() {
+        // A PDA from the vectors below, and the base point of Ed25519 (y = 4/5), which is on the
+        // curve by definition.
+        assert_eq!(
+            signer_kind("GPJkEFWhjnpQADAtoiSQ2upCDSPp7qCNeYtiy8ty2KcF"),
+            "pda"
+        );
+        let mut base = [0x66u8; 32];
+        base[0] = 0x58;
+        assert_eq!(signer_kind(&to_base58(&base)), "key");
+        assert_eq!(signer_kind("not-an-address"), "invalid");
     }
 
     // Reference values computed with solana-address 2.9.0 itself
