@@ -182,6 +182,17 @@ impl Rpc {
     }
 }
 
+/// Data of each account in `addrs` (base58), None for accounts that do not exist, fetched in
+/// batches of 100 with getMultipleAccounts.
+pub fn fetch_accounts(rpc_url: &str, addrs: &[String]) -> Result<Vec<Option<Vec<u8>>>> {
+    let mut rpc = Rpc::new(rpc_url)?;
+    let mut out = Vec::with_capacity(addrs.len());
+    for chunk in addrs.chunks(100) {
+        out.extend(rpc.multiple_accounts(chunk)?);
+    }
+    Ok(out)
+}
+
 fn decode_data(v: &Value) -> Result<Vec<u8>> {
     let s = v[0]
         .as_str()

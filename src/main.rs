@@ -4,12 +4,15 @@
 //!   pqready scan --raw data/raw --out data/scans/2026-11-03
 //!   pqready scan-one path/to/program.so
 
+mod address;
 mod constprop;
 mod elf;
 mod fetch;
+mod identity;
 mod keys;
 mod pqtables;
 mod precompile;
+mod profile;
 mod sbpf;
 mod syscalls;
 
@@ -68,6 +71,33 @@ enum Cmd {
         #[arg(long, default_value_t = 12)]
         after: u64,
     },
+    /// One row per flagged program (classes quantum_vulnerable, review, pq_implementation): name
+    /// from security.txt or the on-chain IDL, what the crypto is used for, the upgrade authority
+    /// and how many programs it controls, joined with optional labels, reviews and activity CSVs.
+    Profile {
+        #[arg(long, default_value = "data/raw")]
+        raw: PathBuf,
+        /// Directory with dependencies.csv from `scan`.
+        #[arg(long)]
+        scan: PathBuf,
+        #[arg(long)]
+        out: PathBuf,
+        /// Fetch IDL accounts (legacy Anchor, Program Metadata) from this RPC.
+        #[arg(long)]
+        rpc: Option<String>,
+        /// CSV with `label` and `program_id` or `authority`; other columns are copied.
+        #[arg(long)]
+        labels: Option<PathBuf>,
+        /// CSV keyed by `program_id`; columns copied with a `review_` prefix.
+        #[arg(long)]
+        reviews: Option<PathBuf>,
+        /// CSV keyed by `program_id`; columns copied with an `activity_` prefix.
+        #[arg(long)]
+        activity: Option<PathBuf>,
+        /// Output column to sort by: numbers descending, text ascending.
+        #[arg(long)]
+        sort_by: Option<String>,
+    },
 }
 
 #[derive(Serialize)]
@@ -124,6 +154,26 @@ fn main() -> Result<()> {
             before,
             after,
         } => inspect(&path, address, before, after),
+
+        Cmd::Profile {
+            raw,
+            scan,
+            out,
+            rpc,
+            labels,
+            reviews,
+            activity,
+            sort_by,
+        } => profile::run(&profile::ProfileOpts {
+            raw,
+            scan,
+            out,
+            rpc,
+            labels,
+            reviews,
+            activity,
+            sort_by,
+        }),
     }
 }
 

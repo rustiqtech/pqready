@@ -11,6 +11,8 @@ base64 = "0.22"
 bs58 = "0.5"
 clap = { version = "4", features = ["derive"] }
 csv = "1"
+curve25519-dalek = "4"
+flate2 = "1"
 goblin = { version = "0.9", default-features = false, features = ["elf32", "elf64", "endian_fd", "std"] }
 hex = "0.4"
 memchr = "2"
