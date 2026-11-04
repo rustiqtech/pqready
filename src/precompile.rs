@@ -123,36 +123,37 @@ pub fn forwarding_wrappers(
     calls: &HashMap<usize, Call>,
 ) -> BTreeSet<usize> {
     let mut entries: BTreeSet<usize> = BTreeSet::new();
-    let mut another_pass = true;
-
-    while another_pass {
-        another_pass = false;
-
-        for (e, fs) in snapshots {
-            if entries.contains(e) {
-                continue;
-            }
-
-            for (site, regs) in &fs.raw_calls {
-                let is_memcmp = match calls.get(site) {
-                    Some(Call::Syscall { name, .. }) => name == "sol_memcmp_",
-                    Some(Call::Internal(i)) => entries.contains(i),
-                    _ => false,
-                };
-                if is_memcmp
-                    && regs[2] == Val::Entry(3)
-                    && ((regs[0] == Val::Entry(1) && regs[1] == Val::Entry(2))
-                        || (regs[0] == Val::Entry(2) && regs[1] == Val::Entry(1)))
-                {
-                    entries.insert(*e);
-                    another_pass = true;
-                    break;
-                }
-            }
+    loop {
+        let found: Vec<usize> = snapshots
+            .iter()
+            .filter(|(e, fs)| !entries.contains(*e) && forwards_to_memcmp(fs, calls, &entries))
+            .map(|(e, _)| *e)
+            .collect();
+        if found.is_empty() {
+            return entries;
         }
+        entries.extend(found);
     }
+}
 
-    entries
+/// Whether some call in `fs` reaches `sol_memcmp_`, directly or through one of `wrappers`, with
+/// this function's own r1, r2 (in either order) and r3.
+fn forwards_to_memcmp(
+    fs: &FnSnapshots,
+    calls: &HashMap<usize, Call>,
+    wrappers: &BTreeSet<usize>,
+) -> bool {
+    fs.raw_calls.iter().any(|(site, regs)| {
+        let is_memcmp = match calls.get(site) {
+            Some(Call::Syscall { name, .. }) => name == "sol_memcmp_",
+            Some(Call::Internal(i)) => wrappers.contains(i),
+            _ => false,
+        };
+        is_memcmp
+            && regs[2] == Val::Entry(3)
+            && ((regs[0] == Val::Entry(1) && regs[1] == Val::Entry(2))
+                || (regs[0] == Val::Entry(2) && regs[1] == Val::Entry(1)))
+    })
 }
 
 #[cfg(test)]
