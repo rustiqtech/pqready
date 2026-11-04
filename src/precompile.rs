@@ -1,8 +1,11 @@
 //! Locator of programs that verify signatures through precompiles
 
-use std::collections::BTreeSet;
-
+use crate::{
+    constprop::{FnSnapshots, Val},
+    sbpf::Call,
+};
 use memchr::memmem;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 #[derive(Debug, Clone)]
 pub struct Ref {
@@ -113,9 +116,50 @@ pub fn locate_ids(
         .collect()
 }
 
+/// Entry instruction indexes of the functions in this code region that forward their arguments to
+/// `sol_memcmp_`.
+pub fn forwarding_wrappers(
+    snapshots: &BTreeMap<usize, FnSnapshots>,
+    calls: &HashMap<usize, Call>,
+) -> BTreeSet<usize> {
+    let mut entries: BTreeSet<usize> = BTreeSet::new();
+    let mut another_pass = true;
+
+    while another_pass {
+        another_pass = false;
+
+        for (e, fs) in snapshots {
+            if entries.contains(e) {
+                continue;
+            }
+
+            for (site, regs) in &fs.raw_calls {
+                let is_memcmp = match calls.get(site) {
+                    Some(Call::Syscall { name, .. }) => name == "sol_memcmp_",
+                    Some(Call::Internal(i)) => entries.contains(i),
+                    _ => false,
+                };
+                if is_memcmp
+                    && regs[2] == Val::Entry(3)
+                    && ((regs[0] == Val::Entry(1) && regs[1] == Val::Entry(2))
+                        || (regs[0] == Val::Entry(2) && regs[1] == Val::Entry(1)))
+                {
+                    entries.insert(*e);
+                    another_pass = true;
+                    break;
+                }
+            }
+        }
+    }
+
+    entries
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::constprop::ConstSet;
+    use Val::{Entry, Unknown};
 
     const ED25519: usize = 0;
     const SYSVAR: usize = 4;
@@ -308,5 +352,154 @@ mod tests {
             all.len(),
             "duplicate chunk: {out:?}"
         );
+    }
+
+    const FORWARDS: [Val; 3] = [Entry(1), Entry(2), Entry(3)];
+
+    fn memcmp() -> Call {
+        Call::Syscall {
+            name: "sol_memcmp_".into(),
+            via_reloc: true,
+        }
+    }
+    fn consts(v: i64) -> Val {
+        Val::Consts(ConstSet::from([v]))
+    }
+
+    /// A function: its entry and, per call site, (site, callee, r1..r3).
+    type Function<'a> = (usize, &'a [(usize, Call, [Val; 3])]);
+
+    fn region(fns: &[Function]) -> (BTreeMap<usize, FnSnapshots>, HashMap<usize, Call>) {
+        let mut snapshots = BTreeMap::new();
+        let mut calls = HashMap::new();
+        for (entry, sites) in fns {
+            let mut f = FnSnapshots::default();
+            for (site, callee, regs) in sites.iter().cloned() {
+                f.raw_calls.insert(site, regs);
+                calls.insert(site, callee);
+            }
+            snapshots.insert(*entry, f);
+        }
+        (snapshots, calls)
+    }
+
+    fn wrappers(fns: &[Function]) -> BTreeSet<usize> {
+        let (s, c) = region(fns);
+        forwarding_wrappers(&s, &c)
+    }
+
+    #[test]
+    fn direct_forwarding_to_the_syscall() {
+        assert_eq!(wrappers(&[(10, &[(14, memcmp(), FORWARDS)])]), [10].into());
+    }
+
+    #[test]
+    fn r1_and_r2_may_be_swapped() {
+        assert_eq!(
+            wrappers(&[(10, &[(14, memcmp(), [Entry(2), Entry(1), Entry(3)])])]),
+            [10].into()
+        );
+    }
+
+    #[test]
+    fn wrapper_of_a_wrapper_at_a_lower_index() {
+        // 0 calls 10 calls 20 calls sol_memcmp_: the map is visited 0, 10, 20,
+        // so each outer wrapper is checked before the one it calls is known.
+        let found = wrappers(&[
+            (0, &[(3, Call::Internal(10), FORWARDS)]),
+            (
+                10,
+                &[(13, Call::Internal(20), [Entry(2), Entry(1), Entry(3)])],
+            ),
+            (20, &[(24, memcmp(), FORWARDS)]),
+        ]);
+        assert_eq!(found, [0, 10, 20].into());
+    }
+
+    #[test]
+    fn caller_passing_constants_is_not_a_wrapper() {
+        // 0 is the rules' typical caller: memcmp(key, &ID, 32) through wrapper 10.
+        let found = wrappers(&[
+            (
+                0,
+                &[(
+                    3,
+                    Call::Internal(10),
+                    [Entry(1), consts(0x1000), consts(32)],
+                )],
+            ),
+            (10, &[(14, memcmp(), FORWARDS)]),
+        ]);
+        assert_eq!(found, [10].into());
+    }
+
+    #[test]
+    fn changed_or_missing_arguments_do_not_forward() {
+        for regs in [
+            [Entry(1), Unknown, Entry(3)], // r2 changed (rule_wrapper_rearranged)
+            [Entry(1), Entry(2), consts(32)], // fixed length
+            [Entry(1), Entry(1), Entry(3)], // same pointer twice
+            [Entry(3), Entry(2), Entry(1)], // length moved
+        ] {
+            assert!(
+                wrappers(&[(10, &[(14, memcmp(), regs.clone())])]).is_empty(),
+                "{regs:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn other_callees_do_not_count() {
+        let memcpy = Call::Syscall {
+            name: "sol_memcpy_".into(),
+            via_reloc: true,
+        };
+        assert!(wrappers(&[(10, &[(14, memcpy, FORWARDS)])]).is_empty());
+        // Forwarding to a function that is not a wrapper (it only logs).
+        let found = wrappers(&[
+            (0, &[(3, Call::Internal(10), FORWARDS)]),
+            (
+                10,
+                &[(
+                    14,
+                    Call::Syscall {
+                        name: "sol_log_".into(),
+                        via_reloc: true,
+                    },
+                    FORWARDS,
+                )],
+            ),
+        ]);
+        assert!(found.is_empty());
+        for c in [Call::Indirect, Call::Unknown, Call::Unresolved(0x1234)] {
+            assert!(wrappers(&[(10, &[(14, c, FORWARDS)])]).is_empty());
+        }
+    }
+
+    #[test]
+    fn one_forwarding_site_is_enough() {
+        // A memcmp with a short inline path and a forwarding call, like the
+        // toolchain's memcmp (Zynko..., instruction 78726).
+        let found = wrappers(&[(
+            10,
+            &[
+                (12, memcmp(), [Entry(1), Unknown, Entry(3)]),
+                (18, memcmp(), FORWARDS),
+            ],
+        )]);
+        assert_eq!(found, [10].into());
+    }
+
+    #[test]
+    fn call_site_missing_from_calls_is_ignored() {
+        let (s, mut c) = region(&[(10, &[(14, memcmp(), FORWARDS)])]);
+        c.clear();
+        assert!(forwarding_wrappers(&s, &c).is_empty());
+    }
+
+    #[test]
+    fn recursion_terminates() {
+        // 10 forwards to itself only: never a wrapper, and the loop ends.
+        assert!(wrappers(&[(10, &[(14, Call::Internal(10), FORWARDS)])]).is_empty());
     }
 }

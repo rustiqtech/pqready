@@ -26,7 +26,7 @@
 
 use crate::constprop::analyze_range;
 use crate::pqtables;
-use crate::precompile::{self, DataRegion, LocatedId, RefBytes};
+use crate::precompile::{self, DataRegion, LocatedId, RefBytes, forwarding_wrappers};
 use crate::sbpf::{Code, OP_LDDW, RelocCall, classify_calls, models_alu};
 use crate::syscalls::{Syscall, by_name};
 use anyhow::{Context, Result, bail};
@@ -351,6 +351,8 @@ pub fn scan_elf(
         report.roots_found |= roots_found;
 
         let res = analyze_range(code, &calls, &roots);
+        let fwd_wrap = forwarding_wrappers(&res.snapshots, &calls);
+
         #[cfg(test)]
         report.snapshots.push(res.snapshots.clone());
 

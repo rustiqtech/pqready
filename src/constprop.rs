@@ -24,24 +24,24 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 /// Larger constant sets collapse to unknown.
 pub const MAX_SET: usize = 16;
 
-type Set = BTreeSet<i64>;
+pub type ConstSet = BTreeSet<i64>;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Val {
     Unknown,
-    Consts(Set),
+    Consts(ConstSet),
     /// Value of register r_i on entry to the current function.
     Entry(u8),
 }
 
 fn consts(c: i64) -> Val {
-    Val::Consts(Set::from([c]))
+    Val::Consts(ConstSet::from([c]))
 }
 
 fn join(a: &Val, b: &Val) -> Val {
     match (a, b) {
         (Val::Consts(x), Val::Consts(y)) => {
-            let u: Set = x | y;
+            let u: ConstSet = x | y;
             if u.len() > MAX_SET {
                 Val::Unknown
             } else {
@@ -126,14 +126,14 @@ pub struct RawSnapshots {
 /// of constants, or None where some path gives a non-constant value.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct FnSnapshots {
-    pub calls: BTreeMap<usize, [Option<Set>; 3]>,
-    pub jumps: BTreeMap<usize, [Option<Set>; 2]>,
-    pub xors: BTreeMap<usize, [Option<Set>; 2]>,
+    pub calls: BTreeMap<usize, [Option<ConstSet>; 3]>,
+    pub jumps: BTreeMap<usize, [Option<ConstSet>; 2]>,
+    pub xors: BTreeMap<usize, [Option<ConstSet>; 2]>,
     pub stores: BTreeMap<usize, Store>,
     /// Value of every `lddw` in the function.
     pub lddws: BTreeMap<usize, i64>,
     /// Address of every load from memory: base + offset.
-    pub mem_loads: BTreeMap<usize, Option<Set>>,
+    pub mem_loads: BTreeMap<usize, Option<ConstSet>>,
     /// r1..r3 at every call before parameters are resolved, so that `Val::Entry(i)` ("this
     /// function's own i-th argument") stays visible.  Argument-forwarding wrappers are recognised
     /// from these.
@@ -142,8 +142,8 @@ pub struct FnSnapshots {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Store {
-    pub addr: Option<Set>,
-    pub value: Option<Set>,
+    pub addr: Option<ConstSet>,
+    pub value: Option<ConstSet>,
     pub size: u8,
 }
 
@@ -263,7 +263,7 @@ pub struct SiteResult {
     /// could not attribute to any function.
     pub reachable: bool,
     /// Possible r1 values at this call site; None = unknown on some path.
-    pub selectors: Option<Set>,
+    pub selectors: Option<ConstSet>,
 }
 
 #[derive(Debug, Default)]
@@ -277,9 +277,9 @@ pub struct RangeResult {
 }
 
 /// Unknown entry values are None; Some(set) is the union so far.
-type EntryVals = Vec<Option<Set>>; // index = register 0..=5
+type EntryVals = Vec<Option<ConstSet>>; // index = register 0..=5
 
-fn resolve(v: &Val, ev: &EntryVals) -> Option<Set> {
+fn resolve(v: &Val, ev: &EntryVals) -> Option<ConstSet> {
     match v {
         Val::Consts(s) => Some(s.clone()),
         Val::Entry(i) => ev.get(*i as usize).cloned().flatten(),
@@ -287,10 +287,10 @@ fn resolve(v: &Val, ev: &EntryVals) -> Option<Set> {
     }
 }
 
-fn merge(a: &Option<Set>, b: &Option<Set>) -> Option<Set> {
+fn merge(a: &Option<ConstSet>, b: &Option<ConstSet>) -> Option<ConstSet> {
     match (a, b) {
         (Some(x), Some(y)) => {
-            let u: Set = x | y;
+            let u: ConstSet = x | y;
             (u.len() <= MAX_SET).then_some(u)
         }
         _ => None,
@@ -330,13 +330,13 @@ pub fn analyze_range(
                 if roots.contains(&e) {
                     vec![None; 6]
                 } else {
-                    vec![Some(Set::new()); 6]
+                    vec![Some(ConstSet::new()); 6]
                 },
             )
         })
         .collect();
     loop {
-        let mut updates: Vec<(usize, usize, Option<Set>)> = Vec::new();
+        let mut updates: Vec<(usize, usize, Option<ConstSet>)> = Vec::new();
         for (f, info) in &fns {
             for (_, callee, args) in &info.call_args {
                 if roots.contains(callee) {
@@ -409,7 +409,7 @@ pub fn analyze_range(
     for (&idx, call) in calls {
         match call {
             Call::Syscall { name, via_reloc } => {
-                let mut selectors: Option<Set> = Some(Set::new());
+                let mut selectors: Option<ConstSet> = Some(ConstSet::new());
                 let (mut attributed, mut reachable) = (false, false);
                 for (f, info) in &fns {
                     if let Some(v) = info.syscall_r1.get(&idx) {
@@ -733,7 +733,7 @@ mod tests {
         (code, r)
     }
 
-    fn set(v: &[i64]) -> Option<Set> {
+    fn set(v: &[i64]) -> Option<ConstSet> {
         Some(v.iter().copied().collect())
     }
 
