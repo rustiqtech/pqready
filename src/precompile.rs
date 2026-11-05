@@ -224,38 +224,73 @@ pub fn region_facts(
     calls: &HashMap<usize, Call>,
     wrappers: &BTreeSet<usize>,
 ) -> IdFacts {
+    const REGISTER_PAIRS: [(usize, usize); 6] = [(0, 1), (0, 2), (1, 0), (1, 2), (2, 0), (2, 1)];
+
     let mut facts: IdFacts = Default::default();
     let addresses: ConstSet = id.addresses.iter().map(|&a| a as i64).collect();
     let holds_address =
         |r: &Option<ConstSet>| r.as_ref().is_some_and(|s| !s.is_disjoint(&addresses));
-    let chunk_set: ConstSet = id.chunks.into();
-    for (e, fs) in snapshots {
-        let operands: BTreeSet<&[Option<ConstSet>; 2]> =
-            fs.jumps.values().chain(fs.xors.values()).collect();
-        let seen_chunks: BTreeSet<i64> = operands
+    let in_an_entry = |s: &ConstSet| {
+        addresses
             .iter()
+            .any(|&a| s.range(a..a + 32).next().is_some())
+    };
+    let chunk_set: ConstSet = id.chunks.into();
+    let length_32 = ConstSet::from([32]);
+
+    for (e, fs) in snapshots {
+        let compared_sites = fs
+            .calls
+            .iter()
+            .filter(|(site, regs)| match calls.get(site) {
+                Some(Call::Syscall { name, .. }) => name == "sol_memcmp_",
+                Some(Call::Internal(i)) => wrappers.contains(i),
+                _ => false,
+            } && ([0, 1].into_iter().any(|r| holds_address(&regs[r])))
+                    && regs[2].as_ref() == Some(&length_32)
+            ).count();
+
+        let operands = fs.jumps.values().chain(fs.xors.values());
+        let seen_chunks: BTreeSet<i64> = operands
             .filter_map(|[a, b]| match (a, b) {
                 (Some(c), None) | (None, Some(c)) => Some(c),
                 _ => None,
             })
             .flat_map(|c| c.intersection(&chunk_set).copied())
             .collect();
-        let fact = IdFacts {
-            compared_sites: fs
-                .calls
+
+        let passed_sites = fs
+            .calls
+            .iter()
+            .filter(|(site, regs)| {
+                matches!(calls.get(site), Some(Call::Internal(i)) if !wrappers.contains(i))
+                    && (REGISTER_PAIRS.into_iter().any(|(r1, r2)| {
+                        holds_address(&regs[r1]) && regs[r2].as_ref() == Some(&length_32)
+                    }))
+            })
+            .count();
+
+        let mut referencing: BTreeSet<usize> = BTreeSet::new();
+        referencing.extend(
+            fs.lddws
                 .iter()
-                .filter(|(site, regs)| match calls.get(site) {
-                    Some(Call::Syscall { name, .. }) => name == "sol_memcmp_",
-                    Some(Call::Internal(i)) => wrappers.contains(i),
-                    _ => false,
-                } && ([0, 1].into_iter().any(|r| holds_address(&regs[r])))
-                        && regs[2].as_ref() == Some(&ConstSet::from([32]))
-                )
-                .count(),
+                .filter(|(_, a)| addresses.contains(*a))
+                .map(|(i, _)| *i),
+        );
+        referencing.extend(
+            fs.mem_loads
+                .iter()
+                .filter(|(_, c)| c.as_ref().is_some_and(in_an_entry))
+                .map(|(i, _)| *i),
+        ); // TODO: similarly for fs.calls and fs.stores
+
+        let fact = IdFacts {
+            compared_sites,
             chunk_compared_functions: usize::from(chunk_set.is_subset(&seen_chunks)),
+            passed_sites,
+            referencing_instructions: referencing.len(),
             ..Default::default()
         };
-
         facts.merge(&fact);
     }
     facts
