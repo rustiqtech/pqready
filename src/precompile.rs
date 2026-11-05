@@ -1,7 +1,7 @@
 //! Locator of programs that verify signatures through precompiles
 
 use crate::{
-    constprop::{FnSnapshots, Val},
+    constprop::{ConstSet, FnSnapshots, Val},
     sbpf::Call,
 };
 use memchr::memmem;
@@ -154,6 +154,136 @@ fn forwards_to_memcmp(
             && ((regs[0] == Val::Entry(1) && regs[1] == Val::Entry(2))
                 || (regs[0] == Val::Entry(2) && regs[1] == Val::Entry(1)))
     })
+}
+
+/// The rule an ID ended up with, in priority order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Rule {
+    KeyList,
+    IdCompared,
+    IdPassed,
+    Referenced,
+    BytesUnreferenced,
+}
+
+impl Rule {
+    /// The `evidence` string in dependencies.csv.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Rule::KeyList => "key_list",
+            Rule::IdCompared => "id_compared",
+            Rule::IdPassed => "id_passed",
+            Rule::Referenced => "referenced",
+            Rule::BytesUnreferenced => "bytes_unreferenced",
+        }
+    }
+}
+
+/// What one code region's reachable functions do with one ID. Counts are sites; merged across
+/// regions by adding.
+#[derive(Debug, Clone, Default)]
+pub struct IdFacts {
+    /// Calls to sol_memcmp_ or a forwarding wrapper where r1 or r2 is one of the ID's data
+    /// addresses and r3 is exactly 32.
+    pub compared_sites: usize,
+    /// Functions in which all four inline chunks of the ID are operands of conditional jumps or
+    /// xors.
+    pub chunk_compared_functions: usize,
+    /// Calls to any other internal function with one of the ID's data addresses in an argument
+    /// register and 32 in another.
+    pub passed_sites: usize,
+    /// Reachable instructions that load, pass or store one of the ID's data addresses, whether or
+    /// not a rule above applies.
+    pub referencing_instructions: usize,
+    /// Some reachable instruction refers to an address within the ID's own 32 bytes (lddw values,
+    /// load addresses, call or store arguments).
+    pub points_into_own_entry: bool,
+    /// Some inline chunk of the ID appears as a jump operand, xor operand or lddw value.
+    pub chunks_seen: bool,
+    /// Call sites where a needed argument is not constant on every path.
+    pub unknown_argument_sites: usize,
+}
+
+impl IdFacts {
+    pub fn merge(&mut self, other: &IdFacts) {
+        self.compared_sites += other.compared_sites;
+        self.chunk_compared_functions += other.chunk_compared_functions;
+        self.passed_sites += other.passed_sites;
+        self.referencing_instructions += other.referencing_instructions;
+        self.points_into_own_entry |= other.points_into_own_entry;
+        self.chunks_seen |= other.chunks_seen;
+        self.unknown_argument_sites += other.unknown_argument_sites;
+    }
+}
+
+/// Facts for `id` in one code region. Called in scan_elf's region loop, after `analyze_range` and
+/// `forwarding_wrappers`.
+pub fn region_facts(
+    id: &LocatedId,
+    snapshots: &BTreeMap<usize, FnSnapshots>,
+    calls: &HashMap<usize, Call>,
+    wrappers: &BTreeSet<usize>,
+) -> IdFacts {
+    let mut facts: IdFacts = Default::default();
+    let addresses: ConstSet = id.addresses.iter().map(|&a| a as i64).collect();
+    let holds_address =
+        |r: &Option<ConstSet>| r.as_ref().is_some_and(|s| !s.is_disjoint(&addresses));
+    let chunk_set: ConstSet = id.chunks.into();
+    for (e, fs) in snapshots {
+        let operands: BTreeSet<&[Option<ConstSet>; 2]> =
+            fs.jumps.values().chain(fs.xors.values()).collect();
+        let seen_chunks: BTreeSet<i64> = operands
+            .iter()
+            .filter_map(|[a, b]| match (a, b) {
+                (Some(c), None) | (None, Some(c)) => Some(c),
+                _ => None,
+            })
+            .flat_map(|c| c.intersection(&chunk_set).copied())
+            .collect();
+        let fact = IdFacts {
+            compared_sites: fs
+                .calls
+                .iter()
+                .filter(|(site, regs)| match calls.get(site) {
+                    Some(Call::Syscall { name, .. }) => name == "sol_memcmp_",
+                    Some(Call::Internal(i)) => wrappers.contains(i),
+                    _ => false,
+                } && ([0, 1].into_iter().any(|r| holds_address(&regs[r])))
+                        && regs[2].as_ref() == Some(&ConstSet::from([32]))
+                )
+                .count(),
+            chunk_compared_functions: usize::from(chunk_set.is_subset(&seen_chunks)),
+            ..Default::default()
+        };
+
+        facts.merge(&fact);
+    }
+    facts
+}
+
+/// Length of the longest run of consecutive 32-byte entries from `builtin` (keys::builtin()) that
+/// contains one of the ID's addresses. Data only, no code.
+pub fn key_list_run(
+    id: &LocatedId,
+    regions: &[DataRegion<'_>],
+    builtin: &HashMap<[u8; 32], &'static str>,
+) -> usize {
+    todo!()
+}
+
+/// Rule order. No ELF needed, so it's tested on hand-made facts.
+pub fn rule_for(facts: &IdFacts, key_list_run: usize) -> Rule {
+    todo!()
+}
+
+/// One row per located ID, for ElfReport.
+#[derive(Debug, Clone)]
+pub struct IdVerdict {
+    pub name: &'static str, // from RefBytes.r
+    pub vulnerable: bool,
+    pub rule: Rule,
+    pub sites: usize, // the sites behind `rule`
+    pub unknown_argument_sites: usize,
 }
 
 #[cfg(test)]
