@@ -24,11 +24,14 @@
 //! syscall site not reachable from any root through direct calls is counted separately as possible
 //! dead code.
 
-use crate::constprop::analyze_range;
+#[cfg(test)]
+use crate::constprop::FnSnapshots;
 use crate::pqtables;
-use crate::precompile::{self, DataRegion, LocatedId, RefBytes, forwarding_wrappers};
+use crate::precompile::{self, DataRegion, LocatedId, RefBytes, Rule, forwarding_wrappers};
+use crate::precompile::{IdFacts, IdVerdict};
 use crate::sbpf::{Code, OP_LDDW, RelocCall, classify_calls, models_alu};
 use crate::syscalls::{Syscall, by_name};
+use crate::{constprop, keys};
 use anyhow::{Context, Result, bail};
 use goblin::container::{Container, Ctx};
 use goblin::elf::{Elf, dynamic, header, program_header, reloc::RelocSection, section_header, sym};
@@ -89,13 +92,17 @@ pub struct ElfReport {
     /// Recorded register values per executable range, for tests only: the rules that use them run
     /// inside `scan_elf`.
     #[cfg(test)]
-    pub snapshots: Vec<std::collections::BTreeMap<usize, crate::constprop::FnSnapshots>>,
+    pub snapshots: Vec<BTreeMap<usize, FnSnapshots>>,
     /// PQ constant tables found in loaded data (see `pqtables`).
     pub pq_tables: Vec<pqtables::TableHit>,
     /// Distinct Keccak round constants among reachable `lddw` values.
     pub keccak_constants_inline: usize,
     /// Weak signals: moduli among immediates, by name, with counts.
     pub pq_weak: BTreeMap<&'static str, usize>,
+    /// Precompile rule application results.
+    pub precompile: Vec<IdVerdict>,
+    /// Convenience flag for comparison against instructions_sysvar account.
+    pub sysvar_compared: bool,
 }
 
 struct Range {
@@ -145,6 +152,7 @@ pub fn scan_elf(
     report.located_ids = precompile::locate_ids(&regions, bytes, &rbs);
     let is_rel = elf.header.e_type == header::ET_REL;
     let section_off = |shndx: usize| elf.section_headers.get(shndx).map(|s| s.sh_offset as usize);
+    let mut facts = vec![IdFacts::default(); report.located_ids.len()];
 
     // Call sites patched by relocations, keyed by file offset of the call.
     let mut reloc_calls: HashMap<usize, RelocCall> = HashMap::new();
@@ -350,8 +358,16 @@ pub fn scan_elf(
         }
         report.roots_found |= roots_found;
 
-        let res = analyze_range(code, &calls, &roots);
-        let fwd_wrap = forwarding_wrappers(&res.snapshots, &calls);
+        let res = constprop::analyze_range(code, &calls, &roots);
+        let wrappers = precompile::forwarding_wrappers(&res.snapshots, &calls);
+        for (id, f) in report.located_ids.iter().zip(facts.iter_mut()) {
+            f.merge(&precompile::region_facts(
+                id,
+                &res.snapshots,
+                &calls,
+                &wrappers,
+            ));
+        }
 
         #[cfg(test)]
         report.snapshots.push(res.snapshots.clone());
@@ -395,6 +411,28 @@ pub fn scan_elf(
         codes.iter().flat_map(|c| c.instrs.iter().map(|i| i.imm)),
         &reachable_lddws,
     );
+
+    let builtin = keys::builtin();
+    let verdicts: Vec<IdVerdict> = report
+        .located_ids
+        .iter()
+        .zip(&facts)
+        .filter(|(id, f)| !id.addresses.is_empty() || f.chunks_seen)
+        .map(|(id, f)| {
+            let rule = precompile::verdict(f, id, &regions, &builtin);
+            IdVerdict {
+                name: id.r.name,
+                vulnerable: id.r.vulnerable,
+                rule,
+                sites: f.sites_for(rule),
+                unknown_argument_sites: f.unknown_argument_sites,
+            }
+        })
+        .collect();
+    report.sysvar_compared = verdicts
+        .iter()
+        .any(|v| v.name == "instructions_sysvar" && v.rule == Rule::IdCompared);
+    report.precompile = verdicts;
 
     Ok(report)
 }

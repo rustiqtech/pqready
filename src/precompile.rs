@@ -216,6 +216,17 @@ impl IdFacts {
     }
 }
 
+impl IdFacts {
+    pub fn sites_for(&self, rule: Rule) -> usize {
+        match rule {
+            Rule::IdCompared => self.compared_sites + self.chunk_compared_functions,
+            Rule::IdPassed => self.passed_sites,
+            Rule::Referenced => self.referencing_instructions,
+            Rule::KeyList | Rule::BytesUnreferenced => 0,
+        }
+    }
+}
+
 /// Facts for `id` in one code region. Called in scan_elf's region loop, after `analyze_range` and
 /// `forwarding_wrappers`.
 pub fn region_facts(
@@ -226,7 +237,6 @@ pub fn region_facts(
 ) -> IdFacts {
     const REGISTER_PAIRS: [(usize, usize); 6] = [(0, 1), (0, 2), (1, 0), (1, 2), (2, 0), (2, 1)];
 
-    let mut facts: IdFacts = Default::default();
     let addresses: ConstSet = id.addresses.iter().map(|&a| a as i64).collect();
     let holds_address =
         |r: &Option<ConstSet>| r.as_ref().is_some_and(|s| !s.is_disjoint(&addresses));
@@ -237,18 +247,21 @@ pub fn region_facts(
     };
     let chunk_set: ConstSet = id.chunks.into();
     let length_32 = ConstSet::from([32]);
+    let is_compare_site = |site: &usize| match calls.get(site) {
+        Some(Call::Syscall { name, .. }) => name == "sol_memcmp_",
+        Some(Call::Internal(i)) => wrappers.contains(i),
+        _ => false,
+    };
+    let is_compared = |regs: &[Option<ConstSet>; 3]| {
+        (regs[..2].iter().any(|r| holds_address(&r))) && regs[2].as_ref() == Some(&length_32)
+    };
 
-    for (e, fs) in snapshots {
+    let step = |mut facts: IdFacts, fs: &FnSnapshots| {
         let compared_sites = fs
             .calls
             .iter()
-            .filter(|(site, regs)| match calls.get(site) {
-                Some(Call::Syscall { name, .. }) => name == "sol_memcmp_",
-                Some(Call::Internal(i)) => wrappers.contains(i),
-                _ => false,
-            } && ([0, 1].into_iter().any(|r| holds_address(&regs[r])))
-                    && regs[2].as_ref() == Some(&length_32)
-            ).count();
+            .filter(|(site, regs)| is_compare_site(site) && is_compared(regs))
+            .count();
 
         let operands = fs.jumps.values().chain(fs.xors.values());
         let seen_chunks: BTreeSet<i64> = operands
@@ -282,18 +295,76 @@ pub fn region_facts(
                 .iter()
                 .filter(|(_, c)| c.as_ref().is_some_and(in_an_entry))
                 .map(|(i, _)| *i),
-        ); // TODO: similarly for fs.calls and fs.stores
+        );
+        referencing.extend(
+            fs.calls
+                .iter()
+                .filter(|(_, regs)| regs.iter().any(holds_address))
+                .map(|(i, _)| *i),
+        );
+        referencing.extend(
+            fs.stores
+                .iter()
+                .filter(|(_, s)| holds_address(&s.value))
+                .map(|(i, _)| *i),
+        );
+
+        let points_into_own_entry = fs
+            .lddws
+            .values()
+            .any(|v| addresses.iter().any(|&a| (a..a + 32).contains(v)))
+            || fs
+                .mem_loads
+                .values()
+                .any(|c| c.as_ref().is_some_and(in_an_entry))
+            || fs
+                .calls
+                .values()
+                .any(|regs| regs.iter().any(|r| r.as_ref().is_some_and(in_an_entry)))
+            || fs
+                .stores
+                .values()
+                .any(|s| s.value.as_ref().is_some_and(in_an_entry));
+
+        let constants: ConstSet = fs
+            .jumps
+            .values()
+            .chain(fs.xors.values())
+            .flatten()
+            .flatten()
+            .flatten()
+            .copied()
+            .chain(fs.lddws.values().copied())
+            .collect();
+
+        let unknown_argument_sites = fs
+            .calls
+            .iter()
+            .filter(|(site, regs)| {
+                is_compare_site(site)
+                    && (regs[..2].iter().any(|r| r.is_none() || holds_address(r)))
+                    && (regs[2].is_none() || regs[2].as_ref() == Some(&length_32))
+                    && !is_compared(regs)
+            })
+            .count();
 
         let fact = IdFacts {
             compared_sites,
             chunk_compared_functions: usize::from(chunk_set.is_subset(&seen_chunks)),
             passed_sites,
             referencing_instructions: referencing.len(),
-            ..Default::default()
+            points_into_own_entry,
+            chunks_seen: !chunk_set.is_disjoint(&constants),
+            unknown_argument_sites,
         };
         facts.merge(&fact);
-    }
-    facts
+        facts
+    };
+
+    snapshots
+        .iter()
+        .map(|(_, fs)| fs)
+        .fold(Default::default(), step)
 }
 
 /// Length of the longest run of consecutive 32-byte entries from `builtin` (keys::builtin()) that
@@ -309,6 +380,15 @@ pub fn key_list_run(
 /// Rule order. No ELF needed, so it's tested on hand-made facts.
 pub fn rule_for(facts: &IdFacts, key_list_run: usize) -> Rule {
     todo!()
+}
+
+pub fn verdict(
+    facts: &IdFacts,
+    id: &LocatedId,
+    regions: &[DataRegion<'_>],
+    builtin: &HashMap<[u8; 32], &'static str>,
+) -> Rule {
+    rule_for(facts, key_list_run(id, regions, builtin))
 }
 
 /// One row per located ID, for ElfReport.
