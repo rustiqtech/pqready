@@ -26,12 +26,11 @@
 
 #[cfg(test)]
 use crate::constprop::FnSnapshots;
-use crate::pqtables;
-use crate::precompile::{self, DataRegion, LocatedId, RefBytes, Rule, forwarding_wrappers};
-use crate::precompile::{IdFacts, IdVerdict};
+use crate::precompile::{self, IdFacts, IdVerdict, LocatedId, RefBytes, Rule, forwarding_wrappers};
+use crate::regions::DataRegion;
 use crate::sbpf::{Code, OP_LDDW, RelocCall, classify_calls, models_alu};
 use crate::syscalls::{Syscall, by_name};
-use crate::{constprop, keys};
+use crate::{constprop, keys, pqtables, regions};
 use anyhow::{Context, Result, bail};
 use goblin::container::{Container, Ctx};
 use goblin::elf::{Elf, dynamic, header, program_header, reloc::RelocSection, section_header, sym};
@@ -412,14 +411,13 @@ pub fn scan_elf(
         &reachable_lddws,
     );
 
-    let builtin = keys::builtin();
     let verdicts: Vec<IdVerdict> = report
         .located_ids
         .iter()
         .zip(&facts)
         .filter(|(id, f)| !id.addresses.is_empty() || f.chunks_seen)
         .map(|(id, f)| {
-            let rule = precompile::verdict(f, id, &regions, &builtin);
+            let rule = precompile::verdict(f, id, &regions);
             IdVerdict {
                 name: id.r.name,
                 vulnerable: id.r.vulnerable,
@@ -468,15 +466,7 @@ pub fn inspect(bytes: &[u8], address: u64, before: u64, after: u64) -> Result<In
     let hi = address + 32 * (after + 1);
     let entries = (lo..hi)
         .step_by(32)
-        .map(|a| {
-            let e = regions.iter().find_map(|&DataRegion { bytes, address }| {
-                let off = usize::try_from(a.checked_sub(address)?).ok()?;
-                bytes
-                    .get(off..off + 32)
-                    .map(|s| <[u8; 32]>::try_from(s).unwrap())
-            });
-            (a, e)
-        })
+        .map(|a| (a, regions::entry_at(&regions, a)))
         .collect();
 
     let ranges = executable_ranges(&elf, bytes.len());

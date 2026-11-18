@@ -13,6 +13,7 @@ mod keys;
 mod pqtables;
 mod precompile;
 mod profile;
+mod regions;
 mod sbpf;
 mod syscalls;
 

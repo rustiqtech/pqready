@@ -2,6 +2,8 @@
 
 use crate::{
     constprop::{ConstSet, FnSnapshots, Val},
+    keys,
+    regions::DataRegion,
     sbpf::Call,
 };
 use memchr::memmem;
@@ -82,11 +84,6 @@ pub struct LocatedId {
     pub addresses: BTreeSet<u64>,
     pub chunks: [i64; 4],
     pub in_file: bool,
-}
-
-pub struct DataRegion<'a> {
-    pub bytes: &'a [u8],
-    pub address: u64,
 }
 
 pub fn locate_ids(
@@ -361,20 +358,17 @@ pub fn region_facts(
         facts
     };
 
-    snapshots
-        .iter()
-        .map(|(_, fs)| fs)
-        .fold(Default::default(), step)
+    snapshots.values().fold(Default::default(), step)
 }
 
 /// Length of the longest run of consecutive 32-byte entries from `builtin` (keys::builtin()) that
 /// contains one of the ID's addresses. Data only, no code.
-pub fn key_list_run(
-    id: &LocatedId,
-    regions: &[DataRegion<'_>],
-    builtin: &HashMap<[u8; 32], &'static str>,
-) -> usize {
-    todo!()
+pub fn key_list_run(id: &LocatedId, regions: &[DataRegion<'_>]) -> usize {
+    id.addresses
+        .iter()
+        .map(|&a| keys::builtin_run_at(regions, a))
+        .max()
+        .unwrap_or(0)
 }
 
 /// Rule order. No ELF needed, so it's tested on hand-made facts.
@@ -382,13 +376,8 @@ pub fn rule_for(facts: &IdFacts, key_list_run: usize) -> Rule {
     todo!()
 }
 
-pub fn verdict(
-    facts: &IdFacts,
-    id: &LocatedId,
-    regions: &[DataRegion<'_>],
-    builtin: &HashMap<[u8; 32], &'static str>,
-) -> Rule {
-    rule_for(facts, key_list_run(id, regions, builtin))
+pub fn verdict(facts: &IdFacts, id: &LocatedId, regions: &[DataRegion<'_>]) -> Rule {
+    rule_for(facts, key_list_run(id, regions))
 }
 
 /// One row per located ID, for ElfReport.

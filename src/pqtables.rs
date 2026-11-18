@@ -29,7 +29,7 @@
 //! reachable `lddw` values pointing into the matched table. As with the
 //! precompile IDs, presence is not use.
 
-use crate::precompile::DataRegion;
+use crate::regions::DataRegion;
 use memchr::memmem;
 use std::collections::{BTreeMap, BTreeSet};
 
