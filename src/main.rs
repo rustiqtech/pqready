@@ -19,6 +19,7 @@ mod syscalls;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
+use precompile::Rule;
 use rayon::prelude::*;
 use serde::Serialize;
 use std::collections::HashMap;
@@ -114,6 +115,7 @@ struct DepRow {
     selectors: String,
     unknown_selector_sites: usize,
     unreachable_sites: usize,
+    unknown_argument_sites: usize,
 }
 
 #[derive(Serialize)]
@@ -269,14 +271,17 @@ fn scan_one(path: &Path) -> Result<()> {
     for (name, n) in &r.pq_weak {
         println!("pq weak signal {name}: {n} immediates");
     }
-    for id in r.located_ids.iter().filter(|id| id.in_file) {
-        let addrs: Vec<String> = id.addresses.iter().map(|a| format!("{a:#x}")).collect();
+    for v in &r.precompile {
         println!(
-            "precompile id {:<28} addresses={} [{}]",
-            id.r.name,
-            id.addresses.len(),
-            addrs.join(", ")
+            "precompile {:<28} rule={:<18} sites={:<4} unknown_argument_sites={}",
+            v.name,
+            v.rule.as_str(),
+            v.sites,
+            v.unknown_argument_sites
         );
+    }
+    if r.sysvar_compared {
+        println!("instructions sysvar compared");
     }
     Ok(())
 }
@@ -415,6 +420,7 @@ fn scan_program(
         selectors: String::new(),
         unknown_selector_sites: 0,
         unreachable_sites: 0,
+        unknown_argument_sites: 0,
     };
 
     let bytes = match fs::read(elf_path(raw, p)) {
@@ -467,17 +473,20 @@ fn scan_program(
             s.unknown_imports = unknown.join(";");
             deps.extend(pq_rows(&r, &dep));
 
-            // where each ID's bytes occur, presence only
-            for id in r.located_ids.iter().filter(|id| id.in_file) {
-                let (evidence, count) = if id.addresses.is_empty() {
-                    ("bytes_outside_data", 1)
-                } else {
-                    ("bytes_in_data", id.addresses.len())
-                };
-                let class = if id.r.vulnerable { "review" } else { "marker" };
+            for v in &r.precompile {
+                let class = precompile::precompile_class(v, r.sysvar_compared);
+                if class == "quantum_vulnerable" {
+                    s.vulnerable_precompile_refs += 1;
+                }
+                let mut evidence = v.rule.as_str().to_string();
+                if class == "quantum_vulnerable" && v.rule == Rule::IdCompared && r.sysvar_compared
+                {
+                    evidence.push_str("+sysvar_compared");
+                }
                 deps.push(DepRow {
-                    count,
-                    ..dep("precompile_ref", id.r.name, class, evidence.into())
+                    count: v.sites,
+                    unknown_argument_sites: v.unknown_argument_sites,
+                    ..dep("precompile_ref", v.name, class, evidence)
                 });
             }
         }

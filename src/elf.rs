@@ -26,11 +26,11 @@
 
 #[cfg(test)]
 use crate::constprop::FnSnapshots;
-use crate::precompile::{self, IdFacts, IdVerdict, LocatedId, RefBytes, Rule, forwarding_wrappers};
+use crate::precompile::{self, IdFacts, IdVerdict, LocatedId, RefBytes, Rule};
 use crate::regions::DataRegion;
 use crate::sbpf::{Code, OP_LDDW, RelocCall, classify_calls, models_alu};
 use crate::syscalls::{Syscall, by_name};
-use crate::{constprop, keys, pqtables, regions};
+use crate::{constprop, pqtables, regions};
 use anyhow::{Context, Result, bail};
 use goblin::container::{Container, Ctx};
 use goblin::elf::{Elf, dynamic, header, program_header, reloc::RelocSection, section_header, sym};

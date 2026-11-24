@@ -9,6 +9,8 @@ use crate::{
 use memchr::memmem;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
+const MIN_KEY_LIST_RUN: usize = 20;
+
 #[derive(Debug, Clone)]
 pub struct Ref {
     pub id: &'static str,
@@ -68,6 +70,7 @@ pub fn decoded_refs() -> Vec<RefBytes> {
 }
 
 /// Returns (ref, occurrence count) for every reference found in `elf`.
+#[cfg(test)]
 pub fn find_refs<'a>(elf: &[u8], ref_bytes: &'a [RefBytes]) -> Vec<(&'a Ref, usize)> {
     ref_bytes
         .iter()
@@ -373,7 +376,17 @@ pub fn key_list_run(id: &LocatedId, regions: &[DataRegion<'_>]) -> usize {
 
 /// Rule order. No ELF needed, so it's tested on hand-made facts.
 pub fn rule_for(facts: &IdFacts, key_list_run: usize) -> Rule {
-    todo!()
+    if key_list_run >= MIN_KEY_LIST_RUN && !facts.points_into_own_entry && !facts.chunks_seen {
+        Rule::KeyList
+    } else if facts.compared_sites > 0 || facts.chunk_compared_functions > 0 {
+        Rule::IdCompared
+    } else if facts.passed_sites > 0 {
+        Rule::IdPassed
+    } else if facts.referencing_instructions > 0 || facts.chunks_seen {
+        Rule::Referenced
+    } else {
+        Rule::BytesUnreferenced
+    }
 }
 
 pub fn verdict(facts: &IdFacts, id: &LocatedId, regions: &[DataRegion<'_>]) -> Rule {
@@ -388,6 +401,38 @@ pub struct IdVerdict {
     pub rule: Rule,
     pub sites: usize, // the sites behind `rule`
     pub unknown_argument_sites: usize,
+}
+
+pub fn precompile_class(v: &IdVerdict, sysvar_compared: bool) -> &'static str {
+    if !v.vulnerable {
+        return "marker";
+    }
+    match v.rule {
+        Rule::IdCompared => {
+            if v.name == "ed25519_precompile"
+                || v.name == "secp256k1_precompile"
+                || v.name == "secp256r1_precompile"
+            {
+                if sysvar_compared {
+                    "quantum_vulnerable"
+                } else {
+                    "review"
+                }
+            } else if v.name == "zk_elgamal_proof_program" {
+                "quantum_vulnerable"
+            } else {
+                "marker"
+            }
+        }
+        Rule::IdPassed | Rule::Referenced => {
+            if v.name == "instructions_sysvar" {
+                "marker"
+            } else {
+                "review"
+            }
+        }
+        _ => "marker",
+    }
 }
 
 #[cfg(test)]
